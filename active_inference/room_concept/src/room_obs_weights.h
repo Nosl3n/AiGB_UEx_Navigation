@@ -1,0 +1,50 @@
+/*
+ *  room_obs_weights.h — the SDF observation term, shared by every solver backend.
+ *
+ *  These two functions used to live in an anonymous namespace inside room_concept.cpp, which was
+ *  fine while Adam/L-BFGS were the only consumers. room_gn_solver needs the SAME per-point weights
+ *  to build its analytic Jacobian: if the two backends disagreed about the weighting, the shadow
+ *  comparison would be measuring that disagreement instead of the solvers. One definition, two
+ *  callers — do not re-derive the weights anywhere else.
+ *
+ *  Definitions are still in room_concept.cpp (they are unchanged); only the linkage moved.
+ */
+#pragma once
+
+#include <torch/torch.h>
+
+#include "door_apertures.h"
+#include "room_concept.h"
+#include "room_model.h"
+
+namespace rc
+{
+    /// Per-point observation weights (range and/or incidence), normalised to mean 1 and DETACHED —
+    /// they are constants at the linearization point, which is exactly what IRLS/Gauss-Newton needs.
+    /// `doors_robot` is every known doorway of this room as a segment IN THE ROBOT FRAME, so the beam
+    /// origin is the origin and no pose translation is needed here. A point whose beam crossed an open
+    /// aperture is weighted by (1 - p_open): its return came from the next room and says nothing about
+    /// this one. Null or empty ⇒ no door term, which is what a room with no known doors gets.
+    torch::Tensor build_observation_weights(const Model& model,
+                                            const RoomConcept::Params& params,
+                                            const torch::Tensor& points_robot,
+                                            const torch::Tensor& pose_theta,
+                                            const Model::SdfQueryResult& query,
+                                            const std::vector<DoorAperture>* doors_robot = nullptr);
+
+    /// The same weights from an EXPLICIT [N,2] room-frame normals tensor (one per point). The SDF path
+    /// passes query.closest_normals; the wall-landmark factors pass each point's wall normal, so both
+    /// terms weight a point identically. Undefined/empty normals ⇒ range weighting only.
+    torch::Tensor weights_from_normals(const RoomConcept::Params& params,
+                                       const torch::Tensor& points_robot,
+                                       const torch::Tensor& pose_theta,
+                                       const torch::Tensor& normals,
+                                       const std::vector<DoorAperture>* doors_robot = nullptr);
+
+    /// 0.5·σ_obs⁻²·mean_i(w_i · huber_δ(d_i)) for one slot, given an already-evaluated SDF query.
+    torch::Tensor compute_observation_loss_from_query(const Model& model,
+                                                      const RoomConcept::Params& params,
+                                                      const torch::Tensor& points_robot,
+                                                      const torch::Tensor& pose_theta,
+                                                      const Model::SdfQueryResult& query);
+} // namespace rc

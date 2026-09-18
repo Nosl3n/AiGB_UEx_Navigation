@@ -1,0 +1,272 @@
+/*
+ *    Copyright (C) 2026 by YOUR NAME HERE
+ *
+ *    This file is part of RoboComp
+ *
+ *    RoboComp is free software: you can redistribute it and/or modify
+ *    it under the terms of the GNU General Public License as published by
+ *    the Free Software Foundation, either version 3 of the License, or
+ *    (at your option) any later version.
+ *
+ *    RoboComp is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU General Public License for more details.
+ *
+ *    You should have received a copy of the GNU General Public License
+ *    along with RoboComp.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include "genericworker.h"
+
+/**
+* \brief Default constructor
+*/
+GenericWorker::GenericWorker(const ConfigLoader& configLoader, TuplePrx tprx) : QObject()
+{
+
+	this->configLoader = configLoader;
+
+    if (!this->configLoader.get<bool>("Component.Debug.Verbose")) {
+        std::cout << "\033[32mINFO\033[0m Verbose mode is disabled" << std::endl;
+        qInstallMessageHandler([](QtMsgType type, const QMessageLogContext& context, const QString& msg) {
+                switch (type) {
+                    case QtDebugMsg:   break; // Suppress qDebug()
+                    case QtInfoMsg:    qInfo().noquote() << msg; break;
+                    case QtWarningMsg: qWarning().noquote() << msg; break;
+                    case QtCriticalMsg: qCritical().noquote() << msg; break;
+                    case QtFatalMsg:   qFatal("%s", msg.toUtf8().constData()); break;
+                    default: qInfo().noquote() << msg; break;
+                }});
+    }
+
+	states["Initialize"] = std::make_unique<GRAFCETStep>("Initialize", BASIC_PERIOD, nullptr, std::bind(&GenericWorker::initialize, this));
+	states["Compute"] = std::make_unique<GRAFCETStep>("Compute", configLoader.get<int>("Period.Compute"), std::bind(&GenericWorker::compute, this));
+	states["Emergency"] = std::make_unique<GRAFCETStep>("Emergency", configLoader.get<int>("Period.Emergency"), std::bind(&GenericWorker::emergency, this));
+	states["Restore"] = std::make_unique<GRAFCETStep>("Restore", BASIC_PERIOD, nullptr, std::bind(&GenericWorker::restore, this));
+
+	states["Initialize"]->addTransition(states["Initialize"].get(), SIGNAL(entered()), states["Compute"].get());
+	states["Compute"]->addTransition(this, SIGNAL(goToEmergency()), states["Emergency"].get());
+	states["Emergency"]->addTransition(this, SIGNAL(goToRestore()), states["Restore"].get());
+	states["Restore"]->addTransition(states["Restore"].get(), SIGNAL(entered()), states["Compute"].get());
+
+	statemachine.addState(states["Initialize"].get());
+	statemachine.addState(states["Compute"].get());
+	statemachine.addState(states["Emergency"].get());
+	statemachine.addState(states["Restore"].get());
+
+	statemachine.setInitialState(states["Initialize"].get());
+
+	connect(&hibernationChecker, SIGNAL(timeout()), this, SLOT(hibernationCheck()));
+
+
+    agent_name = this->configLoader.get<std::string>("Agent.name");
+    agent_id = this->configLoader.get<int>("Agent.id");
+
+    // Create graph
+    auto surNames = configLoader.getSurNames("Agent");
+    if (surNames.empty()) {
+        int domain = this->configLoader.exists("Agent.domain") ? this->configLoader.get<int>("Agent.domain") : 0;
+        auto [it, inserted] = Graphs.emplace("", std::make_shared<DSR::DSRGraph>(0, agent_name, agent_id, 
+                                        this->configLoader.get<std::string>("Agent.configFile"), 
+                                        true, domain));
+        qInfo() << "Default graph loaded";
+        G = it->second;
+    } 
+    else {
+        qInfo() << "Multiple graphs found:" << surNames.size();
+        for (std::string_view surName : surNames) {
+            std::string name{surName};
+            std::string prefix = "Agent." + name;
+
+            Graphs.emplace(name, std::make_shared<DSR::DSRGraph>(0, agent_name, agent_id, 
+                                            configLoader.get<std::string>(prefix + ".configFile"), 
+                                            true, 
+                                            configLoader.get<int>(prefix + ".domain")));
+            qInfo() << "Graph loaded:" << QString::fromStdString(name);
+        }
+        G = Graphs.at(std::string(surNames.front()));
+    }
+}
+
+/**
+* \brief Default destructor
+*/
+GenericWorker::~GenericWorker()
+{
+    // Avoid mutating graph state from the base destructor during process
+    // teardown; shutdown-owned node cleanup is handled earlier.
+}
+void GenericWorker::killYourSelf()
+{
+    qInfo() << "Killing myself";
+	emit kill();
+}
+
+/**
+* \brief Change compute period of state
+* @param state name of state
+* @param period Period in ms
+*/
+void GenericWorker::setPeriod(const std::string& state, int period)
+{
+    auto it = states.find(state); 
+    if (it != states.end() && it->second != nullptr)
+    {
+		it->second->setPeriod(period);
+		qInfo() << "Period for state" << QString::fromStdString(state) << "changed to" << period << "ms";
+	}
+    else
+        qWarning() << "No change in the period; the state is not valid or not configured.";
+}
+
+int GenericWorker::getPeriod(const std::string& state)
+{
+    auto it = states.find(state);
+
+    if (it == states.end() || it->second == nullptr)
+    {
+        qWarning() << "Invalid or unconfigured state:" << QString::fromStdString(state);
+        return -1; 
+	}
+    return it->second->getPeriod();
+}
+
+void GenericWorker::hibernationCheck()
+{
+	//Time between activity to activate hibernation
+    static const int HIBERNATION_TIMEOUT = 5000;
+
+    static std::chrono::high_resolution_clock::time_point lastWakeTime = std::chrono::high_resolution_clock::now();
+	static int originalPeriod;
+    static bool isInHibernation = false;
+
+	// Update lastWakeTime by calling a function
+    if (hibernation)
+    {
+        hibernation = false;
+        lastWakeTime = std::chrono::high_resolution_clock::now();
+
+		// Restore period
+        if (isInHibernation)
+        {
+            this->setPeriod("Compute", originalPeriod);
+            isInHibernation = false;
+        }
+    }
+
+    auto now = std::chrono::high_resolution_clock::now();
+    auto elapsedTime = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastWakeTime);
+
+	//HIBERNATION_TIMEOUT exceeded, change period
+    if (elapsedTime.count() > HIBERNATION_TIMEOUT && !isInHibernation)
+    {
+        isInHibernation = true;
+		originalPeriod = this->getPeriod("Compute");
+        this->setPeriod("Compute", 500);
+    }
+}
+
+void GenericWorker::hibernationTick(){
+	hibernation = true;
+}
+
+void GenericWorker::restore_window_settings()
+{
+    QSettings settings(QStringLiteral("RoboComp"), QString::fromStdString(agent_name));
+
+    for (const auto& [name, window] : windows)
+    {
+        if (window == nullptr)
+            continue;
+
+        settings.beginGroup(settings_group_name(name, agent_id));
+
+        const QByteArray geometry = settings.value(QStringLiteral("geometry")).toByteArray();
+        if (!geometry.isEmpty())
+            window->restoreGeometry(geometry);
+
+        const QByteArray state = settings.value(QStringLiteral("state")).toByteArray();
+        if (!state.isEmpty())
+            window->restoreState(state, kWindowStateVersion);
+
+        settings.endGroup();
+    }
+
+    qInfo() << "Window settings restored for" << windows.size() << "window(s)";
+}
+
+void GenericWorker::save_window_settings() const
+{
+    QSettings settings(QStringLiteral("RoboComp"), QString::fromStdString(agent_name));
+
+    for (const auto& [name, window] : windows)
+    {
+        if (window == nullptr)
+            continue;
+
+        settings.beginGroup(settings_group_name(name, agent_id));
+        settings.setValue(QStringLiteral("geometry"), window->saveGeometry());
+        settings.setValue(QStringLiteral("state"), window->saveState(kWindowStateVersion));
+        settings.endGroup();
+    }
+
+    settings.sync();
+    qInfo() << "Window settings saved for" << windows.size() << "window(s)";
+}
+
+QString GenericWorker::settings_group_name(const std::string& graph_name, int agent_id)
+{
+    const QString graph_suffix = graph_name.empty() ? QStringLiteral("default")
+                                                    : QString::fromStdString(graph_name);
+    return QStringLiteral("windows/%1/%2").arg(agent_id).arg(graph_suffix);
+}
+
+std::shared_ptr<DSR::DSRViewer> GenericWorker::find_graph_viewer(const std::string& name) const
+{
+    const auto it = graph_viewers.find(name);
+    if (it == graph_viewers.end())
+        return nullptr;
+
+    return it->second;
+}
+
+std::shared_ptr<DSR::DSRViewer> GenericWorker::setupViewer(std::shared_ptr<DSR::DSRGraph> graph, const std::string& prefix, QMainWindow* parent)
+{
+    int current_opts = 0;
+    DSR::DSRViewer::view main = DSR::DSRViewer::view::none;
+    using opts = DSR::DSRViewer::view;
+
+    // Estructura de datos para iterar las opciones (más limpio que muchos IFs)
+    const std::vector<std::pair<std::string, opts>> options = {
+        {"tree", opts::tree}, {"graph", opts::graph}, 
+        {"2d", opts::scene}
+    };
+
+    for (const auto& [suffix, flag] : options) {
+        if (this->configLoader.get<bool>(prefix + "." + suffix)) {
+            current_opts |= flag;
+            if (suffix == "graph") main = opts::graph;
+        }
+    }
+    if (current_opts!=0)
+    	return std::make_shared<DSR::DSRViewer>(parent, graph, current_opts, main);
+	else
+		return nullptr;
+};
+
+void GenericWorker::initialize(){
+    for (const auto& [name, Graph] : Graphs) {
+        std::unique_ptr<QMainWindow> window = std::make_unique<QMainWindow>();
+        window->setWindowTitle(QString("%1-%2|%3").arg(QString::fromStdString(agent_name)).arg(agent_id).arg(QString::fromStdString(name)));
+
+        std::string prefix = "Agent";
+        if (Graphs.size()>1)
+            prefix += "." +name;
+
+        std::shared_ptr<DSR::DSRViewer> viewer = setupViewer(Graph, prefix, window.get());
+        if (viewer){
+            graph_viewers.emplace(name, std::move(viewer));
+            windows.emplace(name, std::move(window));
+        }
+    }
+};

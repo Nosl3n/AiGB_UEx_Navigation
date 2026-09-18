@@ -1,0 +1,61 @@
+cmake_minimum_required(VERSION 3.16)
+project(media_transport_bench LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+find_package(fastcdr REQUIRED)
+find_package(fastdds REQUIRED)
+
+# The IDL source list lives in ONE place, shared with ai_common::media (common/CMakeLists.txt),
+# so a new FrameKind cannot be added to the agents and silently leave this bench unlinkable.
+include(${CMAKE_CURRENT_SOURCE_DIR}/idl_sources.cmake)
+
+add_executable(media_bench
+  bench/media_bench.cpp
+  media_transport.cpp
+  ${AI_COMMON_IDL_SOURCES}
+)
+
+target_include_directories(media_bench PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(media_bench PRIVATE fastdds fastcdr)
+
+# Descriptor round-trip under the AGENT'S locale. It calls setlocale(LC_ALL,"") itself,
+# because a standalone harness stays in "C" and the es_ES decimal-comma bug simply
+# VANISHES -- the test and the agent would then answer different questions about the
+# same string. Run it as:  LANG=es_ES.UTF-8 ./descriptor_roundtrip
+add_executable(descriptor_roundtrip
+  bench/descriptor_roundtrip.cpp
+  media_transport.cpp
+  ${AI_COMMON_IDL_SOURCES}
+)
+target_include_directories(descriptor_roundtrip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(descriptor_roundtrip PRIVATE fastdds fastcdr)
+
+# Beam-geometry probe: reads one frame off a lidar plane and prints the elevation span,
+# the layer step, and the mean elevation PER AZIMUTH SECTOR — the measurement that tells a
+# tilted FAN (pitch, flat across sectors) from a tilted SWEEP PLANE (roll, sinusoidal).
+add_executable(lidar_probe
+  bench/lidar_probe.cpp
+  media_transport.cpp
+  ${AI_COMMON_IDL_SOURCES}
+)
+target_include_directories(lidar_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(lidar_probe PRIVATE fastdds fastcdr)
+
+# End-to-end frame-age probe: prints the LAG distribution on a live media plane plus the stamp-delta
+# shape that tells a producer's polling phase from a producer that is dropping frames. The headless
+# twin of the viewers' lag readout (common/viewers/frame_lag.h) — same quantity, no Qt.
+add_executable(lag_probe
+  bench/lag_probe.cpp
+  media_transport.cpp
+  ${AI_COMMON_IDL_SOURCES}
+)
+target_include_directories(lag_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(lag_probe PRIVATE fastdds fastcdr)

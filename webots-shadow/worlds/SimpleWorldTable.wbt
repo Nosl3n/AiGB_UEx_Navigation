@@ -1,0 +1,82 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/floors/protos/RectangleArena.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/appearances/protos/Parquetry.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/solids/protos/SolidBox.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/tables/protos/Desk.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/tables/protos/Table.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/appearances/protos/VarnishedPine.proto"
+EXTERNPROTO "../protos/Shadow.proto"
+
+WorldInfo {
+  info [
+    "Simulation of the ROBOLAB shadow robot."
+  ]
+  title "ROBOLAB shadow"
+  basicTimeStep 16
+  contactProperties [
+    ContactProperties {
+      material1 "InteriorWheelMat"
+      coulombFriction [
+        0, 2, 0
+      ]
+      frictionRotation -0.785398 0
+      bounce 0
+      forceDependentSlip [
+        10, 0
+      ]
+    }
+    ContactProperties {
+      material1 "ExteriorWheelMat"
+      coulombFriction [
+        0, 2, 0
+      ]
+      frictionRotation 0.785398 0
+      bounce 0
+      forceDependentSlip [
+        10, 0
+      ]
+    }
+  ]
+}
+Viewpoint {
+  orientation 0.38546902035810643 0.3827186364530277 -0.8396070983833431 1.7517747410758735
+  position 0.06868584067554707 2.7167622416633357 4.044028726556297
+}
+DEF shadow Shadow {
+  translation 0.5427203408024759 -0.22527126309532128 0.03252546548705376
+  rotation 0.0019387336616245611 -0.0018802779242983211 -0.9999963529267077 -1.6013975713518747
+}
+RectangleArena {
+  translation 0.113884 -0.0956555 1.42109e-14
+  floorSize 10 5
+  floorAppearance Parquetry {
+    type "light strip"
+  }
+  wallThickness 0.08
+  wallHeight 3
+}
+Table {
+  translation 2.46543 -0.333269 -4.06787e-13
+  rotation 0 0 -1 -5.307179586466759e-06
+  trayAppearance VarnishedPine {
+    colorOverride 0.2 0.6745 0.5764
+    textureTransform TextureTransform {
+      scale 10 10
+    }
+  }
+}
+SolidBox {
+  translation 7.47123 1.0853 -0.26
+}
+TexturedBackground {
+  texture "noon_park_empty"
+}
+TexturedBackgroundLight {
+}
+
+Desk {
+  translation 2.61152 -4.69769 -9.76997e-14
+}

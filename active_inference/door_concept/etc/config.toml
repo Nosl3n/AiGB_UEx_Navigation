@@ -1,0 +1,387 @@
+
+# --- Common Agent Data ---
+[Agent]
+id = 15 # unique across the shared graph: room=5 robot=6 table=7 controller=8 retina=9 bottle=10 kinova=11 self_calib=12
+name = "door_concept"
+
+# --- Single Instance Configuration ---
+# Use this if you only have one graph.
+configFile = ""
+domain = 0
+tree = false
+graph = false
+2d = false
+3d = false
+
+# --- Multiple Instance Template ---
+# If you define multiple instances, the single instance config above will be ignored.
+# [Agent.instance_name]
+# configFile = ""
+# domain = 1
+# tree = true
+# graph = true
+# 2d = true
+# 3d = true
+
+[Presence]
+required_agent_names = ["robot_concept", "room_concept"]
+config_dir = "etc"
+monitor_period_ms = 500
+heartbeat_timeout_ms = 3000
+rejoin_grace_ms = 1500
+stale_grace_ms = 120000
+agent_info_period_ms = 1000
+
+[Owns]
+# ★FIXED 2026-07-31: this read "door_concept 20" while [Agent].id above is 15 — a stale copy from
+# chair_concept. Owns.nodes matches by EXACT name (or a prefix when the entry ends in '*'), and this agent's
+# own node is named "<name> <id>" = "door_concept 15", so the old entry matched NOTHING: the agent's own node
+# leaked into the persistent graph on every graceful shutdown. Keep in sync with [Agent].id.
+# "door_*" covers the per-instance door nodes (door_scene_graph.cpp names them "door_<N>") so they are torn
+# down by the SHARED presence-coordinator cleanup. See CONCEPT_AGENT_LIFECYCLE.md §5 (OWNERSHIP).
+nodes = ["door_concept 15", "door_*"]
+
+[Period]
+Compute = 100
+Emergency = 500
+
+[Component.Debug]
+Verbose = false
+
+[Media]
+MasksStallTimeoutMs = 3000   # 0 = disable the stall gate
+
+[DoorModel]
+# ── AI2 recursive-Laplace belief (mirrors table_concept). ──
+SigmaObs = 0.05                  # compound-SDF band for the candidate/residual split in observe()
+SdfThresholdForStorage = 0.08    # on-surface membership for the candidate/residual split
+AI2CsvPath = "etc/ai2_log.csv"   # per-cycle AI2 log (state + Σ diag + range/motion); empty disables
+AI2SigmaBaseM = 0.03
+AI2ClutterFrac = 0.10
+AI2ClutterScaleM = 0.12
+AI2ClutterStructureGain = 1.0    # density-aware clutter: shrink the clutter prior for seat-coplanar points (closes the escape valve → seat_d recovers with honest Σ). 0 = flat clutter
+AI2PriorSizeStd = 0.15
+AI2ProcessStdM = 0.005
+AI2ProcessStdYaw = 0.01
+AI2ProcessStdSize = 0.0005       # process noise for RIGID size DOFs (≪ pose; furniture shape doesn't drift)
+AI2AgeNominalDtS = 0.0           # stale-belief aging: mask nominal period (s). >0 ⇒ Σ inflates by Q·(dt/this) while unseen (measurement-age→covariance); 0 = freeze on stale. Try 0.1.
+AI2FloorZ = 0.0                  # room-frame floor plane; cz is PINNED here (shared, view-independent)
+AI2FloorStd = 0.03               # floor-height uncertainty (m) → common-mode z
+AI2SeatAnchorStd = 0.04          # seat-layer height-anchor obs noise (m); 0 disables. Pins seat_h to the dense seat layer (gauge fix)
+AI2SeatAnchorBand = 0.12         # seat-layer mean-shift bandwidth (m) — vertical scale separating seat from contamination
+AI2SeatExtentStd = 0.02          # seat-layer FOOTPRINT (seat_w/seat_d) span-anchor obs noise (m); 0 disables. Fixes seat_d collapse
+AI2CommonModePosStd = 0.03
+AI2CommonModeSizeStd = 0.02
+AI2CommonModeYawStd = 0.03
+AI2RangeNoiseLatPerM = 0.02      # static range → R + position common-mode (m per m)
+AI2RangeNoiseYawPerM = 0.03      # static range → yaw common-mode (rad per m) — anti far-view rotation
+# Ego-motion "be-still-to-update" fixation (ported from table_concept). A frame captured while the robot moves is
+# a shared smear → routed into the per-frame COMMON-MODE (caps its authority to move the mean), not per-point R.
+# Geometry updates concentrate at stillness; moving frames only confirm. Continuous, 0 at stillness. 0 disables.
+MotionCmPosGain = 0.30           # position (cx,cy) shared-error std per m/s of motion_dotd — anti-DRIFT  (0.10→0.30)
+MotionCmYawGain = 0.50           # yaw shared-error std (rad) per m/s of motion_dotd      — anti-ROTATE (0.12→0.50);
+                                 # the "passing by rotated the door" lever. 0 at stillness → zero cost stationary,
+                                 # so push higher (0.7–1.0) if a moving pass still swings yaw.
+# "Be-still-to-update" as CONTINUOUS PRECISION (AIF, no threshold): a frame's authority to MOVE the mean falls off
+# smoothly with an UNRELIABILITY = motion × off-axis-position. Still OR well-centred → full authority; moving AND
+# peripheral → the frame only CONFIRMS. Motion = per-mask motion_dotd OR'd with the robot's measured ego-speed;
+# off-axis penalty grows with the mask centroid radius². Feeds the pose common-mode AND the existence reliability.
+AI2AngLeverM   = 2.0             # rad/s → m/s lever (tangential speed of a door ~this far) for the ego angular term
+AI2PeriphRef   = 0.50            # centroid radius (focal-norm, tan of off-axis angle) where the periphery penalty
+                                 # saturates to 1; 0.50 ≈ tan(27°). Smaller = only near-axis counts as "central".
+AI2MotionRefMps = 0.60           # motion (m/s) at which a fully-peripheral frame becomes fully unreliable (existence)
+# A/B FALLBACK — the OLD hard gate (predict-only when moving & off-centre). Default OFF; the continuous precision
+# above is the live path. Set AI2MotionConfirmOnly=true to compare; the four keys below feed only that path.
+AI2MotionConfirmOnly = false
+AI2StillLinMps   = 0.05
+AI2StillAngRadps = 0.10
+AI2StillDotd     = 0.05
+AI2MovingUpdateCenterRadius = 0.35
+AI2TruncGateFrac = 0.10          # skip the geometric update (predict only) when this fraction of the mask is on the image border
+AI2GnIters = 4                   # Gauss-Newton iterations per frame
+AI2ExtentStd = 0.05              # extent-observation noise (m) for the coverage/extent likelihood
+
+[DoorConcept]
+# Detector truth table → etc/detect_probe.csv (shared schema, common/detect_probe/detect_probe.h).
+# One row per cycle per live door: robot pose, how the door projected, what p_detect predicted, and
+# whether a mask actually arrived. ★The robot pose is the point: absence is integrated as if each frame
+# were an independent trial, and while the robot is stopped only ~5% of camera frames carry a new image
+# — so a parked robot re-integrates the SAME PIXELS thousands of times. De-duplicate by viewpoint before
+# fitting anything over these rows. Empty path disables.
+DetectProbeCsvPath = "etc/detect_probe.csv"
+
+# RGB CONTOUR CHECK — score this door's OWN projected leaf face against image edges (common/contour_edge).
+# ★Classifier-free, which is the entire point. The ADE20K posterior over a plainly visible closed door
+# falls 0.995 -> 0.138 -> 0.048 as the robot closes and the network calls it `wall` at 0.676 — but the
+# door's jamb and lintel are still in the RGB. This asks whether the image has a boundary where the
+# belief predicts one, scored against the same quad displaced along the wall so there is no per-scene
+# constant. Computed HERE and not in retina: retina projects the DSR node's box with a transform pinned
+# to a different stamp, and a defence measured on a not-quite-right contour is not a defence.
+# LIVE: the delta it produces is integrated into the existence log-odds (rc::exist MODALITY 3). It also
+# brings up the ZED DEPTH plane, which asks the metric half of the same question — is there a surface at
+# the distance the belief predicts, with space behind its edge — and that is what a poster of a door
+# cannot pass. Logged per cycle as edge_* (RGB) and dep_* (depth) in door_existence_log.csv, where a
+# count of 0 means NOT MEASURED and is not the same as a verdict of 0.
+RgbContourCheck = true
+
+# ── THE METRIC (ZED DEPTH) HALF OF THAT CHANNEL — OFF, 2026-09-13, ON MEASUREMENT ──────────────────
+# The depth test asks whether there is a surface at the distance the belief predicts. On a door
+# CONFIRMED correctly fitted (hanging from its wall, corroborated in viewer3d) it voted to REMOVE on
+# 489/489 cycles moving and 40/40 parked — never once positive — at a near-constant -0.52..-0.58,
+# driven by a depth bias pinned at -0.20 m parked / -0.25 m moving inside an 8 cm band. That is a
+# systematic calibration disagreement, not an absence, and door_instance.h already calls it "a fit
+# error, not an absence" in the comment on the very field it comes from.
+# ★WHAT IT COST: the door's survival came to depend on the RGB contour outrunning a permanent penalty.
+# Parked, the contour reads +2.65 and wins easily. On the frames where YOLO goes blind it falls to
+# +0.53, the sum goes negative, and the door is deleted — three times in one six-minute run. The deaths
+# READ as YOLO blindness; blindness only removed what had been masking a constant negative.
+# ⚠WHAT TURNING IT OFF COSTS: a door that has genuinely gone loses the one channel that can say "we are
+# looking straight through the place it is supposed to be", so removal now rests on mask absence and is
+# slower. This is a hold pending a measurement of where the 20 cm lives — ZED depth bias at this range
+# (retina has a LiDAR-anchored depth-correction dataset for exactly this) or the check's own sampling.
+ContourDepthCheck = false
+
+# DOOR ACTUATION — ask a provider to open/close a door (RoboCompDoorControl), from the strip UI buttons.
+# ★A CAPABILITY, NOT A SIMULATOR. The provider may be the Webots supervisor, home automation, or a
+# person asked over TTS; on the real robot there is no Webots, so this must never be a dependency on one.
+# ⚠ENDPOINT: webots-bridge listens on 10017 (etc/config.toml, the file it is actually run with). An
+#   older note recorded 10008; the bridge's own config comment documents that disagreement and says
+#   10017 wins. Empty string disables the feature and the UI says so.
+# ✅The bridge reports canActuate = TRUE. Its [DoorControl] Doors list was enabled 2026-09-09 with the
+#   loaded world checked rather than the names trusted: piso.wbt carries `DEF DOOR_0 Door` and
+#   `DEF DOOR_1 Door`, and the bridge advertises only DEFs that actually resolve. Verified 2026-09-12
+#   that the live process is `bin/Webots2Robocomp etc/config.toml`, i.e. the file that sets the list —
+#   the bridge's own header used to name the other file, which is why this note said FALSE for weeks.
+#   The buttons are live; they still disable themselves whenever no door is believed.
+DoorControlEndpoint = "doorcontrol:tcp -h localhost -p 10017"
+
+StateEps = 0.04             # Σ|Δstate| threshold between cycles for convergence (m+rad)
+KStable = 30                # consecutive stable frames before model_stable
+DetectionAliveMaxFrames = 40 # cycles without a fresh door mask before detection_alive=false
+ObsDistance = 1.8           # comfortable maximum stand-off from the target face for epistemic poses
+MinStandOffM = 2.0          # min stand-off floor for epistemic viewpoints (YOLO misses doors seen too close)
+EpistemicCooldownCycles = 200 # min cycles a satisfied door stays withdrawn (anti-chatter)
+DoorLogPeriodFrames = 30   # per-door log throttle
+SupportBankMaxPoints = 4000   # max number of door-owned support points kept in memory
+SupportBankQuantizationM = 0.02 # dedup grid (m) for support-bank hashing
+SupportSelectRadiusMarginM = 0.50 # per-door XY ownership gate margin for mixed proto-doors
+SupportSelectHeightMarginM = 0.25 # extra Z margin above door height when selecting owned points
+RtCovUpload = true          # upload the door pose covariance (rt_covariance_att, 6×6 SE3) onto the room→door RT edge from the belief Σ
+RtCovScale = 1.0            # var = RtCovScale · Σ_ii; calibrate toward NEES≈1
+RtCovAddChain = true        # Part B: add the localization/chain cov J·Σ_chain·Jᵀ to the published RT cov
+
+[DoorAffordance]
+# ── THE THREE PRAGMATIC AFFORDANCES: approach / open / cross ────────────────────────────────────────
+# Siblings of the epistemic `aff_door_N` under the same door node, and a different KIND of offer: that
+# one asks the controller for a LOOK that shrinks Σ, these ask it to DO something to the door. Each is
+# published only while this agent believes the action is possible at all — a door you cannot reach cannot
+# be opened, a door that is shut cannot be crossed. Those are not low-value offers, they are NOT OFFERS.
+#   aff_door_N_approach  always, for a located door. Completion predicate = door_reach_prob.
+#   aff_door_N_open      while the robot is in the actuation zone AND the aperture is believed shut.
+#                        Claiming it makes THIS agent ask a provider (webots-bridge DoorControl) to move
+#                        the leaf. Completion predicate = door_open_prob — never the provider's reply.
+#   aff_door_N_cross     while the aperture is believed passable for this robot's body. Completion
+#                        predicate = door_crossing_progress, signed against the side held at claim time.
+# ★The model is in src/door_pragmatics.h and the protocol in common/pragmatic_affordance — read the first
+#  before changing anything here: none of these preconditions is a threshold, and the two Prob keys below
+#  are a Bayesian decision on a probability (same shape as Existence.RemovalProb), not a cutoff on a
+#  distance or an angle.
+Enabled = true
+
+# Physical geometry. All four are MEASUREMENTS or CAPABILITIES, not tuning knobs.
+# ★THE ACTUATION ZONE IS A BAND [near, far], and only the FAR edge is configured.
+# NEAR edge is DERIVED per door: aperture width + half the robot's body + SwingClearanceM. A leaf hinged
+# on the aperture edge sweeps a circle of its own width, so at 90 deg it reaches a full width out from the
+# wall plane — and `LeafState::swing` is never fitted, so we cannot claim it opens away from us. A robot
+# inside that arc is struck by the door it just asked to be opened. Measured 2026-09-13 on the live door:
+# w = 1.00 m, body 0.60 m, clearance 0.20 m  ->  near edge 1.50 m. The retired ApproachStandoffM was 1.00 m,
+# i.e. INSIDE the arc, and the old disc-shaped zone kept `open` on offer as the robot got closer still.
+ActuationReachM   = 2.00     # far edge: beyond this a request is not unambiguously about THIS door
+SwingClearanceM   = 0.20     # margin on top of the swept arc and the body half-width
+# The provider's hinge speed, rad/s. ⚠MUST MATCH webots-bridge [DoorControl] SwingRate (0.5 as of
+# 2026-09-13, ~3.1 s for 90 deg). This agent predicts the leaf angle as (rate x elapsed) while a swing is
+# in flight so it is not surprised by its own request; predicting FASTER than the real hinge means
+# believing the door open while it is still moving. DoorControl.idsl does not advertise the rate, so the
+# duplication is forced — advertising it is the real fix.
+ActuationSwingRate = 0.5
+CrossStandoffM    = 1.20     # how far PAST the aperture the cross target sits
+CrossClearanceM   = 0.80     # distance past the aperture plane that counts as fully through
+# ★THE ROBOT'S OWN BODY, in the one direction in which a doorway closes. Shadow's lateral half-width
+# measured off the robocomp meshes is 0.2938 m per side (0.588 m across); the hull compiled into
+# rc::RobotFootprint::shadow() is 22.2 mm NARROWER per side than the mesh it claims to come from, and on
+# P3Bot it is a different body altogether. ⚠This value is SHADOW's — move it into a [Platform.<robot>]
+# overlay before running on anything else. See common/robot_footprint/mesh_hull.h and ROBOT_GEOMETRY.md.
+RobotPassageWidthM = 0.60
+PassageMarginM     = 0.10    # clearance demanded on top of the body width
+# σ floor for door_reach_prob. With σ == 0, P(d ≤ R) is exactly the distance threshold this design avoids.
+PoseSigmaFloorM    = 0.10
+# Width of the leaf-angle belief when the image is not currently resolving it. estimate_phi() refills
+# phi_curve only from a fresh mask, and [DoorConcept].RgbContourCheck above records why that matters: the
+# ADE20K posterior over a plainly visible closed door falls 0.995 → 0.138 → 0.048 as the robot CLOSES on
+# it. So the curve is typically absent at exactly the range from which `open` must be taken; on those
+# cycles P(passable) marginalises over N(phi_est, this) instead. A PRIOR WIDTH, not a measurement.
+# 0 disables the fallback — `open`/`cross` then appear only while the door is actively segmented.
+PhiSigmaRad        = 0.25
+
+# Offer policy: the ONE decision boundary, stated as the probability it actually is, with a Schmitt band
+# so a precondition hovering at its boundary cannot chatter a node in and out of the shared graph.
+OfferProb     = 0.60         # offer once P(precondition) rises above this …
+WithdrawProb  = 0.35         # … and withdraw once it falls below THIS (must be < OfferProb; refused at load)
+StableCycles  = 3            # … and only after the decision has held this many MEASURED cycles
+
+# ── THE `transitable` SELF-EDGE: door --[transitable]--> door ──────────────────────────────────────
+# Asserted on the door's own node while this agent believes the robot can get through it, so another
+# agent can ask the GRAPH instead of re-deriving passability from geometry it would have to fetch,
+# transform and interpret for itself — three chances to derive it differently from us.
+# ★"transitable", NOT "open", and the distinction is real. The belief is P(clear span >= THIS ROBOT'S
+# passage width), so the edge says "this body fits", not "the leaf has moved": a door ajar by 20 cm is
+# open and not transitable, and a doorway passable for this robot may not be for a larger one. Naming it
+# after the quantity actually computed stops a consumer reading it as a claim about the door's mechanism.
+# ★A SELF-EDGE rather than an attribute because `update_node` is a whole-node replace on both sync
+# engines: a peer refreshing this node from a stale copy would silently revert or destroy a flag. Same
+# reasoning that put the affordance execution claim on an edge.
+# ★UNMEASURED HOLDS: on a cycle where nothing measured the aperture, neither band advances and the edge
+# is left as it is. "We did not look" is not "it is shut" — door_open_prob publishes -1 for NOT MEASURED
+# for exactly that reason, since 0 there is a real answer meaning "believed shut".
+# ⚠`transitable` is already a registered cortex edge type, so this needs NO reinstall — and it currently
+# has ZERO users anywhere in active_inference: door_concept is its first writer and nothing reads it yet.
+TransitableProb          = 0.60   # assert once P(passable) rises above this …
+NotTransitableProb       = 0.35   # … and retract once it falls below THIS (must be < the above; refused at load)
+TransitableStableCycles  = 3      # … and only after the decision has held this many MEASURED cycles
+
+# ★VALUE — POLICY PLACEHOLDERS, DELIBERATELY LOW, AND NOT A MEASUREMENT. An epistemic gain is a measured
+# entropy reduction in nats. A pragmatic value is the expected free energy reduction from reaching a GOAL
+# STATE, and nothing in this system currently wants to be on the other side of a door — so the honest
+# value of "cross" is near zero until a mission layer asks for it. These are set low on purpose: the
+# door's offers stay VISIBLE and selectable when nothing else bids, without out-bidding the fleet's
+# exploration. When a mission layer arrives it should WRITE these and they should stop being config.
+# (approach's value additionally decays with P(reach): approaching a door you are already at is worth
+#  nothing, which is what stops a complete→re-offer→complete ping-pong at the doorway.)
+# ★★★AND WHEN THESE STOP BEING CONFIG, THE REPLACEMENT MUST NOT BE A FUNCTION OF THE MEAN ALONE — it
+# latches. The price gates the claim, the claim is the only source of evidence, so a pessimistic belief
+# stops the sampling that could correct it and freezes with every instrument healthy. Price it with the
+# expected information gain too: a wide posterior means an uncertain doorway, and an uncertain doorway is
+# worth trying BECAUSE trying it resolves the uncertainty. Full reasoning at DoorPragmaticCfg in
+# src/door_config.h — read it before replacing these three numbers.
+ValueApproach = 0.5
+ValueOpen     = 0.3
+ValueCross    = 0.3
+
+ApproachTimeoutS = 60.0
+OpenTimeoutS     = 12.0      # provider latency + swing time, not a navigation budget
+CrossTimeoutS    = 40.0
+
+# ★MAY THIS AGENT ASK A PROVIDER TO MOVE A DOOR WITHOUT A HUMAN? The `open` affordance's whole point is
+# that it can, and the consumer's claim is the trigger. Kept as a switch because the request is an act in
+# the world with a real cost when the provider is a PERSON (DoorActuator::Caps::requires_human).
+AutonomousActuation = true
+# Which door the PROVIDER should move, by its own advertised id. Empty ⇒ resolve BY PLACE from the pose we
+# send, which needs the room↔world registration solved (etc/door_world_registration.csv, fed by the strip
+# buttons). ⚠Measured live: root←room is NOT that transform — 6.45 m and ~90.3° out — so a by-place
+# request without a solved registration is refused LOCALLY rather than sent to open some other door.
+# ✅The bridge CAN actuate: its [DoorControl] Doors list is enabled and resolves DOOR_0/DOOR_1 in
+# piso.wbt (see [DoorConcept].DoorControlEndpoint above). So the remaining obstacle to an autonomous
+# `open` is identity, not capability — name an id here, or donate one correspondence with a button press.
+ActuationProviderId = ""
+
+[Tracker]
+# Multi-instance birth/associate/death (shared rc::InstanceTracker) — the only instance-lifecycle path.
+# Masks are associated to instances by a covariance-gated 1-to-1, an unexplained mask spawns a new door,
+# and the MERGE operator collapses two instances on the same door.
+GateMahalanobis = 9.0     # χ²₂ gate (~3σ) for a mask↔instance match once it has a cov
+GateFallbackM = 0.40     # metric XY gate (m) before an instance has a usable covariance
+DetectionNoiseM = 0.20   # R in the association innovation cov S=P+R²I (≥ centroid-vs-fit offset)
+BirthFrames = 6.6        # ideal OBSERVATIONS of unexplained evidence before spawning a door.
+                         # ★RETUNED 2026-09-09 for the graded semantic model. Every semantic mask used to
+                         # report conf = 1.000 exactly (the ADE20K export emitted an argmax with no scores),
+                         # so this constant was calibrated against evidence worth 1.0 x range_term per look.
+                         # The "-probs" export gives real confidences: measured over 45623 door slices this
+                         # run, median 0.826 (p10 0.676, p90 0.910). Birth evidence is proportional to
+                         # confidence, so 8 became ~33% slower to reach at the p10 end for no modelled
+                         # reason. 8 x 0.826 = 6.6 restores the SAME time-to-birth at the median.
+                         # ⚠This is a rescaling, not a relaxation: a weak mask is still worth less than a
+                         # strong one, which is the point of grading them. It does NOT lower the bar for a
+                         # low-confidence blob — that blob just contributes its own smaller share.
+BirthMinSepM = 0.70      # a birth must be ≥ this (m) from every existing door (anti-duplicate)
+MergeOverlap = 0.20      # collapse two instances whose seat footprints overlap ≥ this fraction of the smaller, keeping the more-observed. 0 disables.
+# Stillbirth prune — a phantom born from association churn starves once the real instance reclaims its
+# mask. Prune a YOUNG instance (still inside its probation window) left unassigned for a sustained streak.
+                         # With the §3.1 position gate now fixed (no far mis-claims), the stillbirth prune's
+                         # phantom-killing job is redundant and was a prime suspect for "create-then-remove"
+                         # churn (a glimpsed door pruned before it matures). Removal is by MERGE only.
+BirthSeatW = 0.45        # seed seat width/depth + seat/back heights for a freshly born door node
+BirthSeatD = 0.45
+BirthSeatH = 0.45
+BirthBackH = 0.45
+NllCost = false          # association cost = ½(m²+ln|S|) NLL (compete by likelihood, not raw distance)
+# ZED-only BIRTH: only a ZED slice (per-pixel depth ⇒ depth_var==0) may SPAWN a door. A ricoh LiDAR-reprojected
+# depth slice (depth_var>0) has unreliable depth/extent → it may associate/confirm an existing door but NOT birth
+# one (this is what created door_3 — a wrong ricoh detection at 8.8 m, outside the room). ZED drives geometry,
+# ricoh confirms. Set RicohBirthEnabled=true to allow a confident, low-variance ricoh-depth slice to birth too.
+RicohBirthEnabled = false
+RicohBirthConf = 0.60      # min YOLO confidence for a ricoh birth (only when RicohBirthEnabled)
+RicohBirthMaxVar = 0.005   # max depth_var (m²) for a ricoh birth (only when RicohBirthEnabled)
+
+[Existence]
+# Existence log-odds on the SHARED rc::exist channel (common/existence_belief/existence_belief.h) — the same
+# one table_concept and chair_concept use. Evidence is the PIXEL-LEVEL silhouette: the fitted panel is
+# projected into the ZED and every predicted sample votes
+#   lit by a "door" mask   → OCCUPANCY (confirms)
+#   lit by a NON-door mask → OCCLUDED  (excluded from the detectable footprint — no vote)
+#   lit by nothing         → ABSENCE   (removes; fires even on a frame with no door mask at all)
+#   outside the image      → NOT DETECTABLE
+# and n_detectable == 0 ⇒ HOLD. That last line is the whole point: "never looked at" is not "looked at and
+# empty", so turning the robot around can no longer delete a door. Detectability is MEASURED from the
+# projection (subtended area × visible fraction × how centrally the robot is looking), which is why the old
+# EvidenceGain / ExpectedSupportC / AdequacyRef / AdequacyCap / CalibAdapt / VacateConfidentFrames /
+# OcclusionCheck / ZedEdgeOffset / ZedRangeFull / ZedRangeRef / ZedClearLosFloor knobs are all gone.
+Enabled = true           # use the log-odds belief for removal (false → fall back to the stillbirth prune)
+BirthLogodds = 1.0       # L seeded at birth (a birth already required BirthFrames of unexplained evidence)
+MaxLogodds = 4.0         # saturation cap: a real door sits here (no door can earn infinite immunity)
+# The ONE decision boundary, stated as the probability it actually is:
+RemovalProb = 0.12       # remove once P(exists) drops below this …
+RemoveFrames = 15        # … and stays below it for this many consecutive EVIDENCE cycles (debounce; counts
+                         # evidence, not wall-clock, so a sensor hiccup can never delete a real door)
+# Physical sensor rates feeding the log-likelihood ratio — interpretable probabilities, not gains.
+DetectionProb = 0.85     # P(a predicted pixel is lit | the door IS there and observable)
+ClutterProb   = 0.05     # P(a predicted pixel is lit | no door there)
+SensorSigmaM  = 0.03     # range/localisation noise σ (m)
+CentralRegionFrac = 0.25 # central image box [f, 1-f]²: absence only counts as removal in proportion to how
+                         # much of the silhouette falls inside it. A door clipping the wide frustum edge is not
+                         # a verifying view — its unexplained absence is epistemic surprise ("go look"), not proof.
+OcclusionMarginM = 0.30  # a door/geometric occluder must be ≥ this many metres CLOSER to block a sample
+# Room-containment pose prior: P(a door centre outside the room walls) ≈ 0 (the room polygon is a trusted nominal
+# model, never fitted). Suppresses out-of-room BIRTHS and removes an instance a localization glitch put outside —
+# even behind a wall where the sensor can never reach it to vacate. Independent of frustum/occlusion.
+RoomPrior = true         # enforce the room-containment pose prior
+RoomMarginM = 0.40       # tolerance a door centre may sit OUTSIDE the walls (wall-hugging door + centroid noise)
+OutOfRoomGain = 1.5      # |ΔL| per frame while outside → removed in a few frames (also debounces a 1-frame glitch)
+# MINIMUM-HEIGHT prior. A door is an aperture a person walks THROUGH, so P(door | it tops out below ~1.8 m)
+# ≈ 0 — a counter, a radiator, a window sill or a low cabinet segmented as "door" is not one. Same kind of
+# categorical prior as RoomPrior (a fact about what a door IS, not a tuned detectability curve), applied the
+# same way: suppress the BIRTH, and draw a strong negative on a live instance that is confidently too short.
+#
+# Judged on the observed SUPPORT top, NEVER on the fitted h. The template anchor (PriorHeightStd 0.08 ⇒
+# precision 156 per frame vs the 8.2 per-frame cap) pins h at 2.00 m whatever the data says, so a phantom fed
+# by a low blob still reports a confident 2.00 m — a test on h can never fire. Measured live: the real door's
+# h moved 2.000 → 2.063, the phantom's never left 2.000.
+#
+# Truncation is the guard that keeps this from deleting real doors: a mask clipped by the image border has an
+# UNOBSERVED top, so its bbox top is only a lower bound. Evidence is weighted by (1 − trunc_frac), so a door
+# the robot only ever sees clipped never reaches MinHeightConf and is never judged — silent, not guessing.
+MinHeightPrior = true
+MinHeightM     = 1.80    # a door's support must reach this height (m, room frame; floor = 0)
+MinHeightConf  = 0.30    # untruncated-evidence weight required before the prior may act (0 = first clean view)
+ShortGain      = 1.5     # |ΔL| per frame while confidently too short (matches OutOfRoomGain)
+# Identity RE-ACQUISITION: a removed door leaves a ghost (its name + the belief it converged to). A detection
+# landing within this radius of a ghost is the SAME door coming back — it takes that name and resumes that
+# geometry instead of being born as door_N+1. Existence restarts from BirthLogodds: the shape is remembered,
+# the confidence is re-earned. Without this, one flicker cost the live run three node identities for one door.
+ReacquireRadiusM = 0.60  # 0 disables re-acquisition (every return is then a brand-new door)
+GhostMax = 8             # most recent removals kept (a short flicker memory, not a permanent map)
+
+[Ice]
+Warn.Connections = "0"
+Trace.Network = "0"
+Trace.Protocol = "0"
+MessageSizeMax = "20004800"

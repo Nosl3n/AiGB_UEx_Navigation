@@ -1,0 +1,469 @@
+
+# --- Common Agent Data ---
+[Agent]
+id = 7 # Change id
+name = "table_concept"
+
+# --- Single Instance Configuration ---
+# Use this if you only have one graph.
+configFile = ""
+domain = 0
+tree = false
+graph = false 
+2d = false
+3d = false
+
+# --- Multiple Instance Template ---
+# If you define multiple instances, the single instance config above will be ignored.
+# [Agent.instance_name]
+# configFile = ""
+# domain = 1
+# tree = true
+# graph = true
+# 2d = true
+# 3d = true
+
+[Presence]
+required_agent_names = ["robot_concept", "room_concept"]
+config_dir = "etc"
+monitor_period_ms = 500
+heartbeat_timeout_ms = 3000
+rejoin_grace_ms = 1500
+stale_grace_ms = 120000
+agent_info_period_ms = 1000
+
+[Owns]
+# "table*" matches every table this agent births/scaffolds (table_1, table_2, …) so none survive a
+# restart as a stale node (mirrors bottle_concept owning "bottle*").
+nodes = ["table_concept 7", "table*"]
+
+[Period]
+Compute = 100
+Emergency = 500
+
+[Component.Debug]
+Verbose = false
+
+# ── Primary-input (masks) stream gate — LIFECYCLE liveness, not a belief knob ──────────────────────────
+# Demote Operating→Degraded→Waiting when the retina's `masks` node stops advancing its mask_frame_id for
+# this long (producer dead/stalled) — don't integrate stale evidence; re-admit automatically when it returns
+# (peers stay intact, so the agent never shuts down). Orthogonal to AI2AgeNominalDtS (belief-axis Σ-aging).
+# MUST exceed the retina HOLD_ENTER_S so a legitimately empty scene (counter still advancing) never trips.
+[Media]
+MasksStallTimeoutMs = 3000   # 0 = disable the stall gate
+
+# ── A/B ONLY — mask frame contract ────────────────────────────────────────────────────────────────
+# The retina publishes mask support points in CAMERA frame; common/mask_ingestor transforms them to
+# the room at the capture stamp (with the pose forward-extrapolated over the RT lag). Set this true to
+# read the producer's LEGACY room-frame array verbatim instead — the pre-flip behaviour — so both paths
+# can be measured against the SAME producer while both arrays still exist.
+#   true  -> baseline (old behaviour)      false -> normal operation (transform done here)
+# Compare the two traces with:  g++ -std=c++23 -O2 -o /tmp/ai2_ab ../common/tools/ai2_ab.cpp
+# ★It has to be a MOVING comparison: at stillness the extrapolation term is identically zero, so the
+#  two paths are algebraically identical and agreement proves nothing.
+# ★Delete this knob once the producer stops publishing the room array (Phase 2) — it is scaffolding.
+[Masks]
+legacy_room_frame = false
+
+# ── AI2 belief (TABLE.md): full-covariance recursive filter; legs derived, soft mixture ──
+# This is the ONLY fit path (the legacy SDF-gradient/Fisher/queue/silhouette fit has been removed).
+[TableModel]
+SigmaObs = 0.05             # top/leg SDF split band (m): a point within TOP_THICKNESS+SigmaObs below the top
+                            # face is attributed to the slab (candidate) vs a leg — used for the mask split.
+SdfThresholdForStorage = 0.08  # |SDF| below which a mask support point is on-surface (candidate) vs residual
+AI2CsvPath = "etc/ai2_log.csv"  # per-cycle AI2 log (state + Σ diag + mask R/bias); empty disables
+BirthSurpriseProbe = true    # EXPERIMENTAL read-only: read residual_concept's `grid` node as a surprise (unexplained-occupancy) field, cluster it, log uncovered high-surprise regions vs the tracker's births → etc/birth_surprise.csv. true to test; no fit/graph effect
+AI2SigmaBaseM = 0.03        # base on-surface obs noise std (m); R = σ² + mask_motion_var per frame
+PixelSigmaOverF = 0.0015    # σ_px/focal → transverse position std per metre of range
+DepthSigma0M = 0.006        # depth std floor (m)
+DepthSigmaRangeCoef = 0.004 # depth std growth (m per m² of range): σ_d = σ0 + coef·range²
+ModelSigmaM = 0.010         # residual model/surface std floor (m)
+# a1′+a2′ (PRECISION_AS_INFORMATION.md): weighted 2-D footprint residual + shared per-frame depth-affine nuisance.
+# THE grazing-yaw fix — models yaw where it lives (the footprint) and marginalizes the common depth bias/scale
+# that aliases into yaw at grazing. REPLACES the footprint-moment channel when on. depth_*_std = ZED depth priors.
+FootprintResidual = false   # true to enable (needs the ray geometry; supersedes the FootprintMoment* + obliquity yaw knobs)
+QuotientChart = false       # C2v symmetry-quotient chart [s,a1,a2] (Stage 3): kills 90°/180° yaw snaps + honest near-square σ_yaw; retires the fold/flip machinery. Pair with FootprintResidual
+DepthTiltStd = 0.020        # shared per-frame depth TILT prior std (m/rad) — the azimuth-odd mode that aliases into yaw
+DepthBiasStd = 0.015        # shared per-frame depth bias prior std (m)   — extent/pos nuisance (future)
+DepthScaleStd = 0.010       # shared per-frame depth scale prior std (fraction) — extent nuisance (future)
+AI2ClutterFrac = 0.10       # ε: prior weight of the uniform clutter mixture component
+AI2ClutterScaleM = 0.12     # a point further than ~this from EVERY surface is explained by clutter
+AI2PriorSizeStd = 0.30      # broad size prior std (m) on w,h,H
+AI2ProcessStdM = 0.005      # predict process-noise std, POSE cx,cy (m/frame) — rigid+static ⇒ small
+AI2ProcessStdYaw = 0.01     # predict process-noise std, yaw (rad/frame)
+# ── "a static dining set must STAY converged" — the two terms that stop a 15-min-old table being re-cut ─────
+# Q is authored PER FRAME, so an UNOBSERVED table's prior decays as sigma ~ sqrt(frames) with nothing stopping
+# it. Measured (ai2_log.csv table_9, cycles 970 -> 2290, ~2 min unobserved, npts=0 throughout): std_w grew
+# 0.030 -> 0.170 m and std_yaw 0.101 -> 0.348 rad on Q alone; the next sparse mask (cycle 2410, 178 pts at
+# 2.39 m) then landed on a 5x-loosened belief and moved the table. Extrapolated to 15 min the walk reaches
+# +-0.47 m of extent and +-54 deg of yaw, i.e. total amnesia — exactly "a rogue mask repositions the set".
+AI2ProcessStdExtentM = 0.0  # EXTENT (w,h,H) process noise, m/frame, SEPARATE from the pose walk above. 0 = a
+                            # table's dimensions are CONSTANTS of the object: it can be nudged, but it never
+                            # grows or shrinks, so its extent must not random-walk. <0 = historic (share
+                            # AI2ProcessStdM). Pose Q stays > 0 so a genuinely moved table is still tracked.
+AI2ClampSigmaToPrior = true # cap Sigma at the PRIOR on predict: knowledge ages back toward what was known
+                            # before the table was ever seen and SATURATES there, instead of diverging
+                            # (Ornstein-Uhlenbeck, not a free random walk). Freshness-as-precision is
+                            # preserved — Sigma still grows monotonically with evidence age, it just stops at
+                            # Sigma_0 — so a 15-minute-old converged table still outweighs one rogue mask.
+                            # false = historic unbounded growth.
+AI2AgeNominalDtS = 0.1      # stale-belief aging: mask stream nominal period (s, 10 Hz masks). Σ inflates by Q·(dt/this) while the feed is silent (measurement-age→covariance) — completes the frozen-frame fix: a stale capture stamp now AGES the belief instead of freezing it. 0 = freeze on stale (historic).
+AI2TruncGateFrac = 0.10     # skip the geometric update when >this fraction of the mask silhouette is on the image border (truncated → biased)
+
+# ── FIXATION gate: the ATTENTION mechanism (eye-fixation analogue) — a DELIBERATE, flagged threshold ─────────
+# WHY A GATE AND NOT MORE GRADED COVARIANCE. Every soft lever here (range, obliquity, coverage, ego-motion
+# common-mode) acts through the per-frame common-mode Sigma_c, and the engine saturates a frame's information
+# at Sigma_c^-1 — a NONZERO asymptote. So a bad frame's authority is ATTENUATED but never ZERO, and the GN mean
+# step still moves the mean by ~Sigma_c^-1 every frame: hundreds of frames at 6 m beat the attenuation. Measured
+# twice on live data after the range and coverage terms were added — the set was STILL repositioned from 6 m.
+# Primates take in detail only during FIXATIONS and actively suppress intake otherwise (saccadic suppression);
+# attention is precision, and an unattended channel's precision is zero — the observation is not integrated at
+# all. This robot has no pan-tilt, so a fixation is the whole-body condition: CLOSE + CENTRED + STILL.
+# Outside a fixation the cycle is predict-only: mean HELD, Sigma inflates. Association and existence do NOT
+# read this, so an unfixated object is still CONFIRMED and tracked — only its pose/shape is frozen.
+# CAVEAT BY DESIGN: an object the robot never approaches, centres and holds still for keeps its BIRTH geometry
+# forever. That is the honest outcome (never claim a shape you never resolved) but it means convergence now
+# REQUIRES going to look. Diagnose with the fixated/fix_close/fix_centred/fix_still/roi_off CSV columns.
+FixationEnabled = true      # false = revert to the graded-only behaviour
+# ★2026-07-30: the CLOSE condition was a hard RANGE cut and it had the physics backwards. Range is only a
+# proxy; what decides whether a frame can resolve the geometry is how much un-cluttered surface lands on the
+# object. A dense far stare is better evidence than a starved near glance, yet the range cut rejected the
+# former. On chair_concept the identical cut froze every instance for 400/400 cycles while the robot was
+# parked and staring. Range now enters via point density, and is kept as a diagnostic / optional condition.
+FixationMinPts = 300        # RESOLVABLE: min mask points before a frame may touch the geometry
+FixationMaxTrunc = 0.10     # RESOLVABLE: max silhouette truncation (mirrors AI2TruncGateFrac)
+FixationRangeM = 0.0        # RETIRED as a gate (0 = off). >0 re-enables the old hard range cut (A/B)
+FixationCentreFrac = 0.60   # CENTRED: max |roi offset|, the "fovea". <=0 disables this one
+FixationStillDotd = 0.05    # STILL: max |motion_dotd| = Z*||sdot|| (m/s), ego-motion mask smear. <=0 disables
+# Static range weighting (motion-free): common-mode error grows with view distance so a far, vague mask
+# can confirm existence but NOT resolve pose/orientation (can't rotate a converged table). Continuous, no gate.
+AI2RangeNoiseLatPerM = 0.02 # lateral deprojection std growth (m per m of range) → feeds R + position common-mode
+AI2RangeNoiseYawPerM = 0.03 # yaw common-mode std growth (rad per m of range) → the binding term vs far-view rotation
+AI2RangeNoiseSizePerM = 0.08 # SIZE (w,h,H) common-mode std growth (m per m of range): the per-frame size info
+                             # SATURATES lower with range, so a distant/vague mask can't reshape or INFLATE a
+                             # converged table (freezes geometry afar; also caps the coverage grow-term). Raise
+                             # to freeze harder at range; the sibling of the lat/yaw range terms. 0 = off.
+# ── COVERAGE (completeness) common-mode: the VIEW-QUALITY half of "close enough to reshape" ────────────────
+# Range alone does not decide whether a frame may re-cut the geometry, and the live log proves it: the worst
+# distortion of the apartment table happened at range 0.75 m — well inside every range term — with completeness
+# 0.28. h jumped +0.76 m in ONE frame, the table stayed ~1.7 m long for 1200 cycles, and only a completeness-1.9
+# view snapped it back (ai2_log.csv table_9, cycles 1127 → 1136 → 2537). A foreshortened/partial footprint is a
+# SLIVER: the per-point SDF can only explain it by stretching the extent, because the rest of the table is not in
+# the measurement at all. So the covariate that licenses RESHAPE is COVERAGE, not distance.
+#   c = observed footprint area / believed w·h ;  sigma_extra = gain * (1/c - 1)
+# Exactly 0 at c >= 1, so a full view is UNCHANGED — and because the term is one-sided it never blocks a table
+# that needs to GROW (c >= 1), only one being re-cut by a partial look. Continuous, no gate: a sliver still
+# confirms the table and still refines what it can see. Live distribution for table_9 (292 fit frames):
+# p25 = 0.32, p50 = 0.55, p75 = 0.98, 23% at c >= 1. At the gains below that leaves the 23% full views with full
+# authority, gives a half view sigma_size = 0.30 m (~1/200 the size information), and effectively freezes
+# geometry on the c ~ 0.2 slivers that did the damage. Set gains to 0 to disable.
+AI2CoverageSizeGain = 0.30  # SIZE (w,h,H) common-mode std (m) per unit of (1/c - 1) — the anti-RESHAPE lever
+AI2CoverageYawGain  = 0.15  # yaw common-mode std (rad) per unit of (1/c - 1)        — the anti-ROTATE lever
+AI2CoveragePosGain  = 0.05  # position (cx,cy) common-mode std (m) per unit of (1/c - 1); small on purpose — a
+                            # sliver still localises the near edge well, it just cannot resize the table
+AI2CoverageMin      = 0.02  # clamp floor on c so 1/c stays finite (caps the inflation)
+AI2GnIters = 4              # Gauss-Newton iterations per frame
+# Per-frame SHARED-ERROR common-mode stds — the information-saturation FLOORS (CLAUDE.md "encode the effect as a
+# continuous covariance"): N correlated points from one frame cannot collapse Σ below these. LOAD-BEARING. They
+# were previously read from these getters with the keys ABSENT from config (silent defaults) — now exposed. A NEW
+# concept agent must expose its own equivalents.
+AI2CommonModePosStd  = 0.03  # shared position (cx,cy) error floor (m)
+AI2CommonModeSizeStd = 0.02  # shared size (w,h,H) error floor (m)
+AI2CommonModeYawStd  = 0.03  # shared yaw error floor (rad)
+
+# ── YOLO-INDEPENDENT LiDAR first-hit range channel (common/ai_belief/lidar_ray_factor.h) ──────────────────
+# Second, sensor-INDEPENDENT evidence: lidar3D returns on the table's LEGS + RIM pin the extent/centre in
+# METRIC range along the viewing ray. Its error mechanism is uncorrelated with the YOLO segmentation, so it
+# attacks the mask-erosion extent UNDER-SIZE (~6cm) the mask cannot self-correct. Consumes the lidar3D media
+# plane (TableLidarIngestor); the media subscriber is created only while this is > 0.
+# ON at 2500 (load-bearing): ≈1/σ²@2cm = depth-point scale → w/h under-size shrinks and extent σ tightens.
+LidarPrecision = 2500.0          # per-ray range precision (1/m², ≈1/σ²@2cm=2500 when load-bearing). 0=OFF
+# A/B: use the LOW 'bpearl' LiDAR as a SEPARATE per-device ray-set (own origin, occlusion-aware first-hit) — it sees
+# the LEGS / lower extent the high 'helios' grazes over. Summed into the SAME GN as helios (NOT merged: each keeps its
+# origin), and feeds the existence leg-occupancy carve from its own origin. Try ~2500 to match helios. 0=OFF (helios only).
+LidarBpearlPrecision = 0.0
+LidarRobustCM = 0.05          # Cauchy scale (m): returns this far off the surface fade out (continuous, no gate)
+LidarSelectMarginM = 0.10     # pre-select returns within (birth half-diagonal + margin) horiz, floor..birth_H vert
+LidarCoverageN0 = 60.0        # LiDAR ray count for full weight; fewer → proportionally down-weighted (sparse-safe)
+LidarCoverageAngPower = 1.0    # ANGULAR-coverage weight precision×=(1−R)^p (R=mean-resultant of return bearings):
+                               # down-weights ONE-SIDED sweeps that over-commit the near-square w↔h mode from a
+                               # single view. 0=off (flat), 1=pure circular variance. Belief still accrues over orbit.
+MaxStepM = 1.0                 # divergence guard: reject a GN centre step > this (m) in one frame (static table)
+# Coverage / traction (EXISTENCE_BELIEF_PLAN.md): on-plane mask points the mixture ceded to CLUTTER exert a
+# GROW-ONLY pull on the top slab, so a model under-covering a large mask grows to explain it (fixes table_1.png:
+# green mask far outside the box, no traction). Self-bounded + on-plane-gated. STAGED — OFF (0.0) by default;
+# try 500 (≈ mask-point scale) and watch w/h grow to the mask extent without over-growing. Anti-contamination
+# bound = free-space carve (not yet wired) → keep modest until then.
+CoveragePrecision = 0.0          # DEBUG BASELINE: OFF (was 500). Re-add after the ZED+LiDAR pair is calibrated.
+CoverageRobustCM = 0.15        # Cauchy scale (m): on-plane points this far outside fade out (stray-point guard)
+
+# Free-space / VACATE (EXISTENCE_BELIEF_PLAN.md Step 4): the SHRINK-only counter-force that BOUNDS CoveragePrecision.
+# A LiDAR beam that passes THROUGH the top-slab band and exits the far side proves that crossing is empty → pull the
+# extent back IN (occupy-where-masked + vacate-where-through settle the extent where camera & LiDAR agree, so coverage
+# can no longer inflate onto clutter). Uses the same sweep as LidarPrecision (auto-staged when either is > 0). Beams
+# that RETURN inside the slab (occupancy) are ignored, so a real tabletop is untouched. Runs SOLO at 500 here
+# (CoveragePrecision is off), bounding the extent from LiDAR through-beams alone.
+FreeSpacePrecision = 500.0         # shrink-only free-space pull strength (per through-beam, ~1/σ²). 0=OFF
+
+# Footprint SECOND-MOMENT factor (table_belief.h): measures (w,h,yaw) from the top-band cloud's 2D inertia
+# tensor and folds it as a linear Gaussian factor into the GN update — the escape from the clutter-trap that
+# leaves a DENSE, bigger/yawed mask unable to rotate/resize the box (the tables_5.png "stuck yaw"). The
+# per-point SDF mixture can't do this: interior top points have ∂sdf/∂yaw≈∂sdf/∂w≈0, and the outboard rim/leg
+# points that carry the signal fall outside the box → routed to clutter. This global statistic uses them all.
+# Also seeds (w,h,yaw) at birth so the box starts near-right. yaw pull scales with extent anisotropy (a square
+# gives none); per-frame authority capped by the range-driven common-mode (far view can't rotate a converged
+# table — no manual gate). NOT applied to cx,cy (partial-view centroid bias; the mixture handles position).
+FootprintMomentPrecision = 2000.0   # A/B: try ~2000 on the right table; 0=OFF (baseline births/fits unchanged)
+
+# Orientation w↔h mode: pure sequential-Bayesian evidence on the TRUE free energy (−log mixture likelihood).
+# No hysteresis/leak/discriminability knobs — those were band-aids for a BROKEN energy readout (clutter silently
+# zeroed misfit → FE≈0 → the mode comparison was noise → periodic 90° flips). With a real FE the evidence is
+# decisive and a near-square table rests at the honest ambiguity on its own.
+# Footprint-moment per-frame covariance: the moment's measurement variance is 1/FootprintMomentPrecision (a static
+# noise FLOOR) + ego-motion mask corruption (motion_var) + (FootprintMomentRangePerM·range)². The extra terms make
+# the moment ACCUMULATE over frames and back off while the robot is moving / far, instead of snapping the belief to
+# each frame's noisy footprint (the live yaw/extent wander). The range coeff is << AI2RangeNoiseSizePerM because a
+# GLOBAL footprint fit is far more range-robust than a single boundary point. Raise to trust the moment less per frame.
+FootprintMomentRangePerM = 0.03
+
+# FE ATTENTION / SURPRISE (active-perception trigger). fe_surprise = smoothed positive gap FE−baseline. The
+# baseline is the "well-fit" free-energy level: it tracks DOWN fast (consolidate a better fit) and UP SLOW so a
+# SUSTAINED mismatch — the table was moved — stays surprising long enough for the robot to attend and dwell until
+# the fit re-converges (FE→baseline → surprise→0). Watch fe_surprise in ai2_log.csv: move a table → spike → decay.
+FeBaselineAdaptDown = 0.05
+FeBaselineAdaptUp   = 0.005
+FeSurpriseSmooth    = 0.10
+
+# Ego-motion coupling (your observation: all misalignments arrive on going-away/rotation frames, where masks are
+# degraded/split). moment variance += (FootprintMomentMotionGain·motion_dotd)² so a moving frame CANNOT reshape the
+# established fit; the w↔h mode accumulator is halved at motion_dotd=OrientationMotionRef so a split mask can't flip
+# it. Both continuous (no gate); static frames (dotd≈0) are unaffected. Raise the gain to freeze harder while moving.
+FootprintMomentMotionGain = 0.30
+OrientationMotionRef = 0.50
+
+# Grazing-view yaw stability (CSV rogue-rotation fix). The tabletop is viewed nearly edge-on (obliquity_cos≈0.09),
+# so yaw is weakly observable and the per-point GN snaps between the box's symmetric orientations (±180° r_π /
+# ±90° w↔h). The continuity fold + per-point obliquity yaw cap were validated live 2026-07-11 and are now ALWAYS
+# ON (no flags): the fold lives in canonicalize(), the cap is kObliquityYawGain in table_fitter.cpp.
+
+# MOMENT-channel yaw stability (CSV rogue-rotation fix, part 2). The per-point caps above do NOT touch the footprint
+# MOMENT factor, but the live rogue rotations came in on the MOMENT channel (dyaw_moment) — a partial/foreshortened
+# view yields a fragmentary footprint whose 2D inertia is spuriously anisotropic, so r_yaw=r_base/aniso² becomes
+# razor-sharp and SNAPS yaw the wrong way (ai2_log.csv cyc1244: completeness≈0.01, aniso≈0.8, dyaw_moment≈-0.57).
+# Both terms inflate moment_extra_var as continuous covariance — no gate. self_test (m): dyaw 0.52→0.02 rad.
+FootprintMomentCompletenessGain = 0.5   # moment var += (gain·(1/completeness−1))², completeness=observed/believed footprint area → a partial-view sliver can no longer rotate a converged table. completeness≥1 (full/larger view) unchanged. 0=OFF
+FootprintMomentMinCompleteness  = 0.02  # clamp floor for 1/completeness in the term above (caps the inflation of
+                                        # a near-zero-completeness sliver). Active whenever the gain is >0 — was a
+                                        # hidden default while its PAIR above was configurable; now exposed.
+ObliquityMomentGain = 0.05              # grazing-view cap on the MOMENT channel: moment var += (gain·(1/|cosθ|−1))². Mirrors ObliquityYawGain (which only guards per-point). 0=OFF
+
+
+# ── Existence / removal (common/existence_belief.h) ───────────────────────────────────────────────────────
+# Each cycle the LiDAR sweep is carved against every table footprint: beams RETURNING inside → occupancy, beams
+# passing THROUGH to beyond → free-space (absence). A per-table occupancy log-odds accrues (common-mode tanh
+# saturated; HOLD when not looked at; free-evidence suppressed while the table is actively seen = hollow guard),
+# and the table is removed when P(occupied) < ExistenceRemovalProb. Evidence-based, NOT a miss counter. STAGED —
+# OFF by default (a mis-removal deletes furniture). Enable + watch the console "[existence] L=..." before trusting.
+ExistenceRemovalEnabled = true    # ON (fit calibrated). Optimizer-orthogonal: writes only inst.existence log-odds, at
+                                  # most delete_node — never touches θ/Σ. Silhouette channel HOLDs on occlusion (non-table
+                                  # mask over the pixels) AND out-of-FoV (in_fov_frac≈0), so an unseen/occluded table is
+                                  # NEVER falsely removed — it removes only when the camera LOOKS and sees empty.
+ExistenceRemovalProb = 0.12    # remove when L < log(p/(1−p)); lower = more conservative
+ExistenceLogoddsMax = 4.0      # clamp |L| so evidence stays finite AND recoverable
+# ── Frame-to-frame correlation of existence observations ──────────────────────────────────────────────
+# ★MEASURED from this agent's own ai2_log 2026-08-09, restricted to the cycles where absence is actually
+# charged (over ALL frames the statistic is dominated by "not in view" and reads 0.98, which is not the
+# quantity wanted):
+#     p_detect>0.3   P(miss)=0.021   P(miss | previous miss)=0.610   rho=0.602
+#     p_detect>0.5   P(miss)=0.010   P(miss | previous miss)=0.333   rho=0.327   <- used (conservative)
+# A miss on those cycles is rare, but once one happens the next is 20-60x likelier than the base rate:
+# the detector fails at a FRAMING, not by independent coin flip. N correlated trials carry an effective
+# sample size N/(1+(N-1)rho), so a miss run saturates at 1/rho however long it gets.
+#
+# THE BUG THIS FIXES: table_1 was removed and reborn three times (1596 / 1455 / 2793 cycles). Each death
+# was a run of consecutive no-mask cycles while the robot drove through the detector envelope's shoulder
+# — 7 cycles, ~0.7 s, L from 4.00 to -0.36 and on to the -4 floor. Every individual charge was right for
+# ONE independent miss; charging seven of them was not. At rho=0.327 those 7 misses are worth 2.36
+# observations and L lands at +1.42 — absence still charged, the table still alive.
+# Set to 0 to restore the previous (independent-frames) behaviour.
+ExistenceFrameCorrelation = 0.327
+
+# ── Shape model selection (round vs square): a LOW-PASS, not an accumulator ────────────────────────────
+# ★2026-08-09. evaluate_shape() re-scores the ACCUMULATED support-bank cloud every evaluation — largely the
+# same points each time — so summing the log-Bayes-factor measured DWELL TIME rather than information: the
+# statistic pinned at the clamp, and recanting then cost as many evaluations as saturating did. Live
+# symptom: the robot looking straight at a SQUARE table that stayed classified round and would not go back.
+# The same lesson ring_config.h already records for its own log-odds ("static furniture re-observed is not
+# new evidence; summing saturated the clamp on cycle 1"), and the same shape as the existence channel's
+# frame-correlation fix made earlier today.
+# 0.15 ~ a 7-evaluation time constant, so a fuller view turns the verdict in bounded time however long the
+# old one stood. 0 restores the legacy sum for an A/B.
+ShapeEvidenceEmaAlpha = 0.15
+
+
+ExistenceDetectionProb = 0.85  # P(beam through an OCCUPIED footprint returns from it) — sensor hit rate
+ExistenceClutterProb = 0.05    # P(beam through an EMPTY footprint returns anyway) — spurious rate
+ExistenceSensorSigmaM = 0.03   # LiDAR range σ (m) for the soft occupancy/free-space surface split
+ExistenceRemoveFrames = 15     # debounce: require the removal decision for this many CONSECUTIVE cycles before
+                               # deleting (a transient association/fit hiccup can't delete a real table)
+
+# ABSENCE evidence degradation vs range + occlusion (no gate). "Predicted-visible but no mask/return there" is
+# weak removal evidence when the sensor likely couldn't resolve the table anyway — far away (tiny projection /
+# sparse beams) or largely occluded. The FREE half of both channels is scaled by (RangeRef/range)^Power (≤1) ×
+# visible_fraction; OCCUPANCY stays fully informative (a distant detection still confirms). Power=0 disables.
+ExistenceAbsenceRangeRefM = 2.5   # range (m) below which absence is trusted at full weight
+ExistenceAbsenceRangePower = 2.0  # decay exponent (2 ≈ angular area ∝ 1/range²)
+# ── LINE OF SIGHT: stop a table in ANOTHER ROOM voting its own removal ──────────────────────────────────────
+# The silhouette channel's only occluder evidence is the NON-table YOLO masks — and YOLO never segments WALLS.
+# So a table behind a wall projects into the camera frustum, lands on unmasked wall pixels, and is scored
+# "predicted-visible but ABSENT": full-strength removal evidence for an object with ZERO visibility. Live proof
+# (ai2_log.csv): table_1 at 5.72 m and table_3 behind a wall, both n_detectable=640 with e_free=640 and
+# streak=15 -> deleted. Identical bug and identical fix as refrigerator_concept and door_concept.
+# PRIMARY test = the room's own wall polygon (delimiting_polygon_x/y on the room node) via the SHARED helper
+# rc::occlusion::walls_block(). Exact, cheap, needs no LiDAR sweep, and is what the sibling agents already use.
+# It arms itself automatically once the room node carries a polygon; no key needed. A sample within ~0.15 m of
+# a wall segment is not occluded by that segment, so a table pushed flush against a wall keeps its samples.
+#
+# OPTIONAL EXTRA below: a LiDAR azimuth oracle for occluders a polygon cannot know about (furniture, people,
+# an open door leaf). Needs a fresh sweep and quantises bearing, so it is OFF by default.
+ExistenceLosMarginM = 0.25   # sample must lie this far BEYOND the first LiDAR hit to count as occluded
+ExistenceLosAzimBins = 0     # 0 = LiDAR oracle OFF (walls_block covers walls). 720 ~ 0.5 deg bins to enable
+
+# ── WHO GETS A VOTE ON "IS THERE A TABLE HERE" (2026-08-06) ──────────────────────────────────────────────────
+# The removal test is: from a viewpoint where we can INFER YOLO should have detected a table (p_detect =
+# range_conf x in_fov_frac x central_frac), it did NOT — for ExistenceRemoveFrames cycles in a row. That test
+# belongs to the camera silhouette, the only sensor that reads a LABEL.
+# The LiDAR is IDENTITY-BLIND: a return proves the volume is OCCUPIED, never that a TABLE occupies it, so
+# P(return|table) ~ P(return|that bin/box/chair) and its likelihood ratio for table-ness is ~1. Measured over
+# ~5400 cycles: the REAL table returned 1.96% of the beams reaching it, a phantom sitting on a mistaken object
+# 6.56% — and both saturated to the same +2.83/cycle, so the channel ranked the phantom 3.3x ABOVE the truth
+# and re-pinned L at the +4 clamp every cycle, after the camera's absence and before the removal test.
+ExistenceLidarConfirms = false  # false = LiDAR does not vote on existence (it still drives the FIT via
+                                # LidarPrecision, and occlusion reasoning, both untouched). true = A/B back to a
+                                # voting LiDAR, by contrast if ExistenceLocalClutter else the historic ratchet.
+# When the LiDAR does vote, measure the clutter prior instead of assuming free space: ExistenceClutterProb asks
+# "P(a beam returns from an EMPTY footprint anyway)", but the alternative to a table in a furnished room is a
+# WALL. An equal-volume shell around the box is carved each cycle and the occupancy becomes a CONTRAST, which is
+# 0 wherever the box is indistinguishable from its surroundings. Diagnose with the ex_q / ex_qn / ex_lllr columns.
+ExistenceLocalClutter = true
+
+# Verification-gated removal (active inference): a predicted-visible-but-absent observation is only evidence of
+# REMOVAL in proportion to P(detect | present, geometry) = range_conf × in_fov_frac × central_frac. The REMAINING
+# absence (from a far / peripheral / edge-on view that CAN'T resolve the table) is epistemic surprise, not removal:
+# it feeds a decayed go-VERIFY accumulator. Above ExistenceVerifySurprise the table is flagged wants_verification
+# and gets an epistemic pull (ExistenceVerifyGain nats) so the controller drives to a resolving ZED view — absence
+# never deletes a table the robot never properly looked at; it sends the robot to look (confirm-or-remove).
+ExistenceVerifySurprise = 20.0    # decayed un-resolvable-absence surprise above which a table wants verification
+ExistenceVerifyGain     = 5.0     # epistemic gain (nats) a wants_verification table gets (drives a resolving view)
+
+# LiDAR removal reliability: the model top slab is a SOLID band but a real tabletop is a THIN plate, so
+# horizontal beams passing UNDER the top surface exit the band and read as false "free" (unreliable absence).
+# Default false ⇒ the LiDAR carve contributes OCCUPANCY only (holds L up), never drives removal; removal is the
+# camera silhouette's job (predicted-visible-but-absent, which HOLDs when out of FoV → a table out of camera
+# view is never falsely removed). Set true only where the slab is a faithful solid model of the tabletop.
+                                # showed an OUT-OF-FoV table (sndet=0 → silhouette correctly HOLDs) deleted purely by
+                                # LiDAR free-space: ex_lfree≈10-16 (beams passing UNDER the thin real top but THROUGH the
+                                # solid model band [H-3cm,H]) swamped ex_locc≈2 (genuine returns proving the table is STILL
+                                # THERE) ~5:1 → ex_L floored at -4, streak→15, removed. The solid-slab LiDAR free is
+                                # model-inconsistent for a thin plate viewed edge-on; it must not drive removal. LiDAR =
+                                # occupancy-only (holds L up); removal is the silhouette's job (HOLDs out-of-FoV → an
+                                # unseen table is never deleted). Re-enable ONLY with a thin-plate LiDAR likelihood.
+# Leg OCCUPANCY: also carve the 4 leg volumes [0, H−t] for confirmation. Occupancy-ONLY (legs are thin → a miss isn't
+# absence; the hollow space between legs must never vote free) ⇒ CANNOT cause a false removal, only holds a real table
+# up. Robust when the thin top slab is at an awkward height for the horizontal LiDAR rings (tall legs get struck).
+ExistenceLegOccupancy = true
+
+[TableConcept]
+
+# ── ROUND vs RECTANGULAR, by model evidence ────────────────────────────────────────────────────────────
+# ★These keys did not exist: all four agents with an evaluate_shape ran on the COMPILED defaults, so the
+# test was untunable and invisible — the same "no config key at all" pattern that hid the fridge's
+# door-clearance prior for a week. Stated here at the values that were already in force.
+#
+# The decision is made on points THIS AGENT accumulated from its own masks' 3D support (the support bank),
+# not on anything the retina publishes back: one view of a table is a partial arc, and round-vs-square
+# only separates once the accumulated cloud spans enough of the rim. Every ShapeEvalPeriod cycles BOTH
+# hypotheses are re-fitted to that cloud — same seed, same R, same iteration budget — and the subtype flips
+# at the zero boundary of a bounded accumulated log-Bayes-factor: evidence, not a threshold.
+#
+# ★2026-08-17: only the ROUND hypothesis used to be re-fitted; the SQUARE one was scored at the live
+# TRACKING belief's state, which is fitted to the mask stream and not to this cloud. One side was therefore
+# optimised on the data it was scored on and the other was not, so the tracker's own transient error read as
+# evidence for ROUND — a 1.26 x 0.69 m RECTANGULAR table (table_3) was classified round for ~2000 cycles.
+# See TableFitter::evaluate_shape and tests/shape_asymmetry.
+ShapeEvalPeriod = 30       # cycles between evaluations
+ShapeEvalMinPoints = 300   # accumulated points before the test can run at all
+# Both models are also fitted from TWO seeds each (mean-radius and PCA-extent) and judged at their BEST fit.
+# That is not belt-and-braces: on the real 401-point bank this agent dumped off the 1.26 x 0.69 m table, the
+# box reaches 0.61x0.68 and LOSES from one seed and 1.12x0.10 and WINS from the other — same points, same
+# budget, opposite verdicts. Scoring each model at one arbitrary local optimum measures optimiser luck.
+#
+# Cost of one evaluation — a batch refit of BOTH models from BOTH seeds, on the main thread, so it is a hitch
+# in the belief loop (~107 ms/cycle live). The verdict is unchanged from 500x10 to 3350x40 (both models score
+# the SAME points, so the comparison is paired); the cost is not: 33 ms vs 385 ms. See tests/shape_asymmetry.
+ShapeFitIters = 20         # iterations EACH hypothesis gets (identical budgets, or the test is not a test)
+ShapeFitMaxPoints = 1000   # stride-subsample of the support bank the test runs on
+# Convergence / cadence + a couple of tuned constants promoted here from hardcoded values (defaults unchanged).
+# StateEps / KStable / DetectionAliveMaxFrames were read by getters with the keys ABSENT from config (silent
+# defaults) — now exposed; a NEW concept agent must expose its own. MatchedFramesBeforeAging / CentralRegionFrac
+# were bare magic numbers in the code, promoted for the same reason.
+StateEps = 0.04             # Σ|Δstate| (m+rad) below which a cycle counts as converged
+KStable = 30                # consecutive converged cycles before the belief is declared model_stable
+DetectionAliveMaxFrames = 40 # cycles without a fresh mask before detection_alive → false
+MatchedFramesBeforeAging = 5 # a barely-born belief (fewer matched frames) is not aged by a stale no-mask cycle
+CentralRegionFrac = 0.25    # central image box [f,1-f]²; a detectable sample inside counts toward p_detect (removal)
+TableLogPeriodFrames = 30   # per-cycle log throttle (cosmetic; no effect on the fit)
+ShowDashboard = true        # false = no GUI (belief dashboard + evidence monitor combined into one window)
+ObsDistance = 1.8           # comfortable maximum stand-off from the target face for epistemic poses
+EpistemicCooldownCycles = 200 # min cycles a satisfied table stays withdrawn (anti-chatter)
+SupportBankMaxPoints = 4000   # max number of table-owned support points kept in memory
+SupportBankQuantizationM = 0.02 # dedup grid (m) for support-bank hashing
+SupportSelectRadiusMarginM = 0.50 # per-table XY ownership gate margin for mixed proto-tables
+SupportSelectHeightMarginM = 0.25 # extra Z margin above table height when selecting owned points
+DumpCloudPath = "/tmp/round_table.xyz" # DIAGNOSTIC one-shot: dump a table's support-bank cloud here for tests/compare_models ("" = off)
+RtCovScale = 1.0            # scales the belief Σ → published room→table RT covariance (calibrate toward NEES≈1)
+PublishObjectObs = true     # publish per-frame ROBOT-frame fit z_o (obj_obs_robot) → room's object-anchor factor
+ObjectObsFrame = "body"     # localizer base frame z_o is expressed in (== room's LIDAR_ROBOT_FRAME)
+
+[Tracker]
+# Multi-instance birth/associate/merge (shared rc::InstanceTracker; the only instance-lifecycle path —
+# prior-scaffold + greedy nearest-mask were removed in Stage 2). "table" masks are associated to instances
+# by a covariance-gated global 1-to-1; an unexplained mask spawns a new table; overlapping tables merge
+# (two can't share space); a table is NEVER retired by occlusion (a long occlusion is not absence).
+GateMahalanobis = 9.0     # χ²₂ gate (~3σ) for a mask↔instance match once it has a cov
+GateFallbackM = 0.50      # metric XY gate (m) before an instance has a usable covariance
+DetectionNoiseM = 0.35    # det-noise std R added to fit cov in the gate (S=P+R²I): covers the mask-centroid
+                          # vs fitted-centre offset of a partially-viewed table (~0.2–0.5 m), else the
+                          # overconfident fit rejects its own detection. Tables are far apart → safe.
+BirthFrames = 8           # frames a mask must stay unexplained before spawning a table
+# FUSED BIRTH (EXPERIMENTAL): residual-grid surprise mass under a detection accelerates its birth. birth_evidence
+# = 1 + Gain·(m/(m+MassRef)) per frame toward BirthFrames; a corroborated detection (high unexplained-occupancy)
+# births in ~1-2 frames, a phantom (m≈0 → evidence 1) serves the full 8-frame debounce. Needs residual_concept.
+BirthFusion = true         # true to enable; needs BirthSurpriseProbe infra (reads the `grid` node)
+BirthFusionGain = 6.0      # max extra evidence/frame at full corroboration (0 ⇒ baseline birth timing)
+BirthFusionMassRef = 8.0   # residual mass at which corroboration is half-saturated
+BirthFusionRadiusM = 0.50  # window (m) for the residual-mass sample under the detection
+BirthMinSepM = 0.60       # a birth must be ≥ this (m) from every existing table (anti-duplicate)
+MergeOverlap = 0.05       # physical exclusion: collapse two instances whose oriented footprints overlap by
+                          # ≥ this fraction of the smaller footprint (two tables cannot share space). 0=off.
+BirthWidthM = 1.0         # default geometry for a table BORN from a mask (the fit refines from here)
+BirthDepthM = 0.6
+BirthHeightM = 0.75
+# Ricoh-360 ATTENTION gate. A slice with depth_var>0 is a peripheral 360-RGB YOLO detection (dense ZED slices
+# have depth_var==0). It is bearing-only: it never births/associates/fits, it only raises attention
+# (process_ricoh_bearings) so the robot seeks a good ZED view.
+RicohAttentionConf = 0.60         # min YOLO confidence for a ricoh detection to raise attention
+
+# Ricoh peripheral attention (process_ricoh_bearings) is always on (validated live): ricoh (depth_var>0)
+# detections raise attention targets but never fit — the ZED fits. NOTE: ricoh depth is reliable only for FRONTAL
+# views; lateral/back views smear the mask cloud, which is why ricoh is attention-only, never a fit source.
+# Ricoh attention association gates: small margins on the physical angular size / range roughness when deciding
+# whether an unassigned ricoh bearing already matches a known table (process_ricoh_bearings).
+RicohAttentionAngleMargin = 0.05  # extra angular tolerance (rad) on the table's angular half-size
+RicohAttentionRangeBandM  = 1.0   # extra range band (m); ricoh range is rough/indicative
+
+[Ice]
+Warn.Connections = "0"
+Trace.Network = "0"
+Trace.Protocol = "0"
+MessageSizeMax = "20004800"

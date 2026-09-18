@@ -1,0 +1,14 @@
+import "JoystickAdapter.idsl";
+
+Component room_concept
+{
+    Communications
+    {
+       subscribesTo JoystickAdapter;   	
+ 	
+    };
+    language Cpp11;
+    options dsr;
+
+};
+

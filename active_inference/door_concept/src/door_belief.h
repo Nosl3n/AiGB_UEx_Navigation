@@ -1,0 +1,313 @@
+/*
+ * door_belief.h  —  AI2 door belief (single wall-anchored panel, on the shared rc::ai engine)
+ *
+ * A door is a THIN RIGID PANEL that lives IN a wall of the room. So — unlike the chair this file was
+ * scaffolded from — the belief does NOT estimate a free 6-DOF pose. The containing wall (a segment of the
+ * room polygon) fixes the door's yaw, its lateral off-wall position, and its floor datum; what remains is
+ * WHERE along the wall it sits and HOW BIG it is. The belief therefore works in the WALL FRAME:
+ *
+ *   State θ = [s, w, h]   (3 DOF)
+ *     s = along-wall offset of the door's NEAR edge from the wall's near corner O   (localised — broad prior)
+ *     w = panel width  (along the wall)                                             (strong prior ~0.70 m)
+ *     h = panel height (vertical, base pinned to the floor)                         (strong prior ~2.00 m)
+ *
+ * The wall frame (near corner O, along-wall unit u, fixed thickness T) is authored by the FITTER each
+ * cycle from the room-polygon wall this door is associated to (params_.wall_O / wall_u / thickness). The
+ * single primitive is one thin box: centre_room = O + (s + w/2)·u  (xy)  + (floor_z + h/2)·ẑ, oriented by
+ * the wall (local x = u along the wall, local y = n across it, local z up), half-extents [w/2, T/2, h/2].
+ *
+ * ONE panel primitive ⇒ n_prims()=1, responsibilities → [panel, clutter]. There is NO orientation
+ * ambiguity (the wall fixes yaw), so the chair's 4-way resolve_orientation / flip accumulator / mode
+ * posterior are GONE. Inference is the shared recursive variational-Laplace filter (3×3 Σ). Pure Eigen,
+ * no torch, no DSR — unit-testable in isolation (self_test()).
+ */
+
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <vector>
+#include <Eigen/Dense>
+
+#include "../../common/ai_belief/recursive_laplace.h"
+#include "../../common/ai_belief/lidar_ray_factor.h"   // rc::LidarRays + lidar_ray_cost
+#include "door_geometry.h"      // rc::door:: Aperture / LeafState / LeafPose — the single geometry source
+
+namespace rc
+{
+
+struct DoorBeliefState
+{
+    float s = 0.0f;    // along-wall offset of the door's near edge from the wall corner O (m)
+    float w = 0.70f;   // panel width  (m, along the wall)
+    float h = 2.00f;   // panel height (m, vertical; base pinned to the floor)
+
+    Eigen::Matrix<float, 3, 1> vec() const
+    { return (Eigen::Matrix<float, 3, 1>() << s, w, h).finished(); }
+    static DoorBeliefState from_vec(const Eigen::Matrix<float, 3, 1>& v)
+    { return {v(0), v(1), v(2)}; }
+};
+
+struct DoorBeliefParams
+{
+    // ── Wall frame (authored by the fitter from the associated room-polygon wall). The door lies IN this
+    //    wall plane; s is measured along u from the near corner O; the panel is T thick across the wall. ──
+    Eigen::Vector2f wall_O = {0.0f, 0.0f};   // near corner of the wall (room frame, m)
+    Eigen::Vector2f wall_u = {1.0f, 0.0f};   // along-wall unit direction (room frame; MUST be normalised)
+    float thickness = 0.05f;                 // panel thickness T (m, across the wall — fixed, not a DOF)
+    float floor_z   = 0.0f;                  // room-frame floor: the door base is PINNED here (not a DOF)
+    float floor_std = 0.03f;                 // floor-height uncertainty (m) → published z covariance
+
+    // ── Leaf articulation (openable door, M0) ────────────────────────────────────────────────────
+    // The hinged panel's opening angle + which aperture edge it hangs from. NOT part of theta: N stays 3
+    // and the shared inference engine is untouched. M0 pins phi = 0 (leaf flush in the aperture, so every
+    // geometry consumer reduces exactly to the old wall-plane behaviour); phi becomes a fitted DOF in M1
+    // and hinge/swing become discrete hypotheses in M2. Authored by DoorFitter::make_belief_params.
+    door::LeafState leaf{};
+
+    // Observation model
+    float sigma_base_m    = 0.03f;
+    float clutter_frac    = 0.10f;
+    float clutter_scale_m = 0.12f;
+
+    // ── Priors (seed Σ diagonal). s is the localised DOF (BROAD); w,h are STRONG template priors. Because
+    //    the shared engine's prior is TEMPORAL (it pulls each frame toward the PREVIOUS state, not a fixed
+    //    template), a strong w/h prior is realised as a tight seed Σ + tiny process noise: Σ_ww/Σ_hh stay
+    //    small so the per-frame prior keeps re-anchoring w,h near their seeded 0.70/2.00, and only sustained
+    //    consistent evidence moves them. The per-frame common-mode on w,h (below) caps how far any single
+    //    mask can push them. No gate — the arbitration is a covariance ratio. ──
+    float prior_s_std = 0.60f;   // broad: the fit localises s
+    float prior_w_std = 0.06f;   // strong: standard door leaf ≈ 0.70 m
+    float prior_h_std = 0.08f;   // strong: standard door leaf ≈ 2.00 m
+
+    // FIXED template anchor: a genuine non-drifting Gaussian prior N(tpl_w,prior_w_std²) / N(tpl_h,prior_h_std²)
+    // applied EVERY frame via accumulate_extra. The shared engine's prior is TEMPORAL (it pulls toward the
+    // previous state), so w,h have no fixed anchor and a persistently over-/under-segmented mask can slowly
+    // random-walk them away from a standard leaf (observed live: w → 1.12 m). This factor pins them to the
+    // template — it costs free energy to move w,h, and only sustained, precise evidence pays for it. No gate.
+    float tpl_w = 0.70f;
+    float tpl_h = 2.00f;
+
+    // Associated wall segment length (m), authored by the fitter. The panel must lie WITHIN its wall, so
+    // apply_constraints clamps s ∈ [0, wall_len − w] when this is > 0 (a door can't run past the corner).
+    float wall_len = 0.0f;
+
+    // Temporal transition (static furniture). s tracks localisation jitter; w,h barely move.
+    // ★A DOORWAY DOES NOT MIGRATE ALONG ITS WALL, so the process noise on `s` is ZERO. This is not a
+    // freeze and not a gate: it is the generative model saying what kind of thing an aperture is. With
+    // no noise injected, the posterior precision on `s` only ever grows, the Kalman gain on it shrinks
+    // in proportion, and the mean stops being dragged — continuously, with no switch anywhere and no
+    // moment at which behaviour changes.
+    // ★IT IS THE DEGENERATE DIRECTION, which is why it matters. `s` and the leaf angle phi explain the
+    // same observations: the fit slides the aperture along the wall to keep a SWUNG leaf on the mask.
+    // Measured: r = -1.000 between the slide and the swing over 27 rows, a 34 cm slide against a 41 deg
+    // swing — one degree of freedom estimated twice by two procedures chasing each other along a
+    // degenerate valley. A 5 mm/cycle random walk on `s` is exactly the licence to do that. Removing it
+    // leaves phi as the only parameter that can absorb a swing, which is the one that physically moves.
+    // ⚠A wrong aperture is then corrected by EVIDENCE against a finite Σ — slowly, in proportion to how
+    // confident we are — or removed by the existence channel, which is the designed path for "this door
+    // is not where we think". It is never corrected by injected noise, because injected noise cannot
+    // tell a real correction from a swing it should not be absorbing.
+    float process_std_s = 0.0f;
+    float process_std_w = 0.001f;
+    float process_std_h = 0.001f;
+
+    // Per-frame COMMON-MODE error (shared by all points of a mask → doesn't average out; Woodbury cap in the
+    // engine, so N correlated points can't collapse σ). chain_cov_s (pose-chain along-wall var) adds to s.
+    float common_mode_s_std  = 0.03f;
+    // A mask's WIDTH/HEIGHT carries a large per-frame SHARED error (the segmentation includes/excludes the
+    // frame, jamb, or a neighbour consistently across all its points), so a single frame must not be able to
+    // out-vote the template anchor. Keep this wide (cap 1/std² BELOW the anchor precision 1/prior_{w,h}_std²)
+    // so one over-segmented mask only nudges w,h — the fix for the live w→1.12 m drift. Continuous, no gate.
+    float common_mode_wh_std = 0.35f;
+
+    // Optimiser
+    int   gn_iters = 4;
+    float fd_eps   = 1e-3f;
+};
+
+// One fitted frame's evidence (room-frame points + per-point measurement variance R). chain_cov_s carries
+// the SHARED pose-chain + static-range variance the fitter computes for the along-wall position (added to
+// the s common-mode). Dimensions (w,h) have no localisation-chain term.
+struct DoorFrame
+{
+    std::vector<Eigen::Vector3f> points;
+    std::vector<float>           R;
+    float chain_cov_s = 0.0f;   // along-wall position variance from the pose chain (m²)
+};
+
+class DoorBelief
+{
+public:
+    static constexpr int N = 3;
+    using State = DoorBeliefState;
+    using Frame = DoorFrame;
+
+    DoorBelief() = default;
+    DoorBelief(const DoorBeliefState& s, const DoorBeliefParams& p) : state_(s), params_(p)
+    { Sigma_.setZero(); Sigma_.diagonal() = prior_cov_diag(); }
+
+    const DoorBeliefState&             state()      const { return state_; }
+    const Eigen::Matrix<float, 3, 3>&  covariance() const { return Sigma_; }
+    const DoorBeliefParams&            params()     const { return params_; }
+    void set_state(const DoorBeliefState& s) { state_ = s; }
+    void set_params(const DoorBeliefParams& p) { params_ = p; }
+    // Author the wall frame this door is anchored to (the fitter calls this each cycle from the associated
+    // room-polygon wall). u is normalised defensively so the SDF's along/across split stays orthonormal.
+    void set_wall(const Eigen::Vector2f& O, const Eigen::Vector2f& u, float len = 0.0f)
+    {
+        params_.wall_O = O;
+        const float n = u.norm();
+        params_.wall_u = (n > 1e-6f) ? (u / n).eval() : Eigen::Vector2f(1.0f, 0.0f);
+        params_.wall_len = std::max(0.0f, len);
+    }
+
+    // ── Geometry read-back for the fitter write-back / scene-graph publish ──────────
+    // NOTE: center_xy()/yaw() describe the APERTURE — the static hole in the wall. They are what the DSR RT
+    // edge, resolve_wall, merge, ghost identity and the room-containment prior key on, precisely because
+    // they cannot be dragged by a swinging leaf. For the LEAF's current pose use leaf_pose() below.
+    float width()     const { return state_.w; }
+    float height()    const { return state_.h; }
+    float thickness() const { return params_.thickness; }
+    float cz()        const { return params_.floor_z; }                       // pinned floor datum (base)
+    float center_z()  const { return params_.floor_z + 0.5f * state_.h; }     // panel centre height
+    // Room-frame (x,y) of the APERTURE centre: along the wall by s+w/2 from the near corner O.
+    Eigen::Vector2f center_xy() const { return params_.wall_O + (state_.s + 0.5f * state_.w) * params_.wall_u; }
+    // Room-frame yaw of the APERTURE = the wall tangent (the aperture's local +x runs along the wall).
+    float yaw() const { return std::atan2(params_.wall_u.y(), params_.wall_u.x()); }
+
+    // ── Aperture / leaf geometry (door_geometry.h is the single source of truth) ──────────
+    // The aperture at an arbitrary state (the SDF needs this for the finite-difference Jacobian), and at
+    // the current one. `leaf` carries the articulation; with phi pinned at 0 the leaf IS the aperture.
+    door::Aperture aperture_at(const DoorBeliefState& s) const
+    {
+        door::Aperture a;
+        a.wall_O = params_.wall_O; a.wall_u = params_.wall_u;
+        a.s = s.s; a.w = s.w; a.h = s.h;
+        a.floor_z = params_.floor_z; a.thickness = params_.thickness;
+        return a;
+    }
+    door::Aperture aperture()   const { return aperture_at(state_); }
+    door::LeafPose leaf_pose_at(const DoorBeliefState& s) const { return door::leaf_pose(aperture_at(s), params_.leaf); }
+    door::LeafPose leaf_pose()  const { return leaf_pose_at(state_); }
+    // ★M1: phi is no longer a pinned construction constant. It is estimated per cycle (DoorFitter::
+    // estimate_phi) from silhouette agreement, with the robot's OWN actuation command as its prior —
+    // so a door the robot asked to be opened is ANTICIPATED rather than experienced as the object
+    // disappearing. It stays outside theta: the belief remains 3-DOF [s, w, h] and the shared inference
+    // engine is untouched, exactly as door_geometry.h's header anticipated.
+    void  set_leaf_phi(float phi) { params_.leaf.phi = phi; }
+
+    // ── THE HINGE BRANCH: free energy as a function of the leaf angle alone ──────────────────────
+    // ★THIS IS THE SAME MINIMISATION THE AGENT ALREADY DOES, RESTRICTED TO ONE COORDINATE. Nothing new
+    // is being introduced: the model has a hinge, phi is the coordinate of that hinge, and this is the
+    // surface term of the same free energy evaluated along it with [s, w, h] held. The aperture is a
+    // hole in a wall and cannot move, so holding it is not an approximation — it is the statement that
+    // only one thing in this object is articulated.
+    // ★AND IT IS THE CURE FOR THE DEGENERACY, structurally. `s` and phi explain the same observations:
+    // the fit slides the aperture along the wall to keep a swung leaf on the mask (measured r = -1.000,
+    // 34 cm of slide against 41 deg of swing). Optimising them jointly lets the pair wander that valley;
+    // optimising phi with `s` held leaves the swing nowhere to go but into the parameter that swings.
+    // Returns 0.5 * SUM d^2 / (sigma^2 + R_i) — the Gaussian surface term, in nats, comparable across
+    // angles for the SAME frame. Points are room-frame; `R` is per-point measurement variance.
+    // ⚠It can only answer about points the leaf could explain. A cloud with nothing on the leaf yields a
+    // flat curve, which is the honest output of a measurement that was not taken — not a vote for phi = 0.
+    [[nodiscard]] float phi_free_energy(const DoorFrame& f, float phi) const;
+
+    // ★THE RAY VERSION, AND IT IS THE ONE THAT CAN SEE A DOORWAY. An aperture is a HOLE: a closed leaf
+    // stops the ray at the wall plane; an open one lets it fly through into the next room. That is a fact
+    // about WHERE RAYS STOP, including the ones that do not, and no cost built from return points can
+    // express it — the through-rays' endpoints are in the next room, so a point-based selection discards
+    // exactly the evidence that distinguishes open from closed. Uses the sensor ORIGIN, which a point
+    // cloud does not carry.
+    [[nodiscard]] float phi_ray_free_energy(const rc::ai::LidarRays& rays, float phi) const;
+
+    // ── THE MEASUREMENT BEFORE THE MODEL CHANGE ──────────────────────────────────────────────────
+    // ★HOW MANY OF THESE RAYS DOES THE MODEL ACTUALLY EXPLAIN, at a given angle? With a leaf-only model
+    // a CLOSED door should already be decisive: nearly every ray in the aperture column should stop ON
+    // the leaf, giving a large free-energy gap against any open hypothesis. Measured 2026-09-13 it was
+    // flat instead — which means the selected rays are NOT stopping on the modelled leaf, and that is a
+    // selection or geometry fault that no change to the likelihood can repair. Suspects, unverified: the
+    // bpearl is a DOWNWARD DOME (ROBOT_GEOMETRY.md), so most of its rays toward a door 2-3 m away may hit
+    // the floor first; the aperture's s or floor_z may be out by more than sigma; the real doorway may
+    // have a step. `helios`, the plane that sees the leaf at mid-height where the lever arm from the
+    // hinge is the full width, is not used for phi at all.
+    // ★`mean_signed` says WHERE they stop instead: negative ⇒ the return is SHORTER than the model
+    // predicts (something in front — floor, step, frame), positive ⇒ the ray flew PAST the leaf. Those
+    // are different faults with different fixes, and a count alone cannot tell them apart.
+    struct RayExplain { int n_hit = 0; int n_explained = 0; float mean_signed_m = 0.0f; };
+    [[nodiscard]] RayExplain phi_ray_explain(const rc::ai::LidarRays& rays, float phi, float tol_m) const;
+    [[nodiscard]] std::vector<std::pair<float, float>>
+    phi_ray_likelihood(const rc::ai::LidarRays& rays, float phi_min, float phi_max, int nstep) const;
+
+    // Argmin over a grid, plus the whole curve so a consumer can marginalise instead of conditioning on
+    // the winner. Weights are exp(-(F - F_min)): a proper likelihood over phi, normalised by the caller.
+    [[nodiscard]] std::vector<std::pair<float, float>>
+    phi_likelihood(const DoorFrame& f, float phi_min, float phi_max, int nstep) const;
+    float leaf_phi() const { return params_.leaf.phi; }
+    Eigen::Vector2f leaf_centre_xy() const { return leaf_pose().centre_xy; }
+    float           leaf_yaw()       const { return leaf_pose().yaw(); }
+
+    // ── Inference (delegated to the shared engine) ────────────────────────────
+    float update(const DoorFrame& frame) { return ai::update<N>(*this, state_, Sigma_, prior_mean_, frame); }
+    void  predict()                      { ai::predict<N>(*this, Sigma_, state_, prior_mean_); }
+    // Age the belief with NO measurement: Σ ← FΣFᵀ + Q·(dt/dt_nominal), mean held. The fitter calls this
+    // when a door's mask stream is stale/dead so Σ grows on the agent's clock instead of freezing.
+    void  inflate_for_age(float dt_s, float dt_nominal_s)
+    { ai::inflate_for_age<N>(*this, Sigma_, state_, prior_mean_, dt_s, dt_nominal_s); }
+    Eigen::Matrix<float, 3, 3> predicted_information(const std::vector<Eigen::Vector3f>& pts, float R) const
+    { return ai::predicted_information<N>(*this, state_, pts, R); }
+
+    // ── Generative-model hooks (engine interface + SDF API) ───────────────────
+    // Single thin-box panel SDF in the wall frame, evaluated at room point p for state s. 0 on the surface;
+    // >0 outside; <0 inside.
+    float sdf_panel(const Eigen::Vector3f& p, const DoorBeliefState& s) const;
+    float sdf_prim (const Eigen::Vector3f& p, const DoorBeliefState& s, int prim) const;  // prim==0 → panel
+    Eigen::Matrix<float, 3, 1> sdf_jacobian(const Eigen::Vector3f& p, const DoorBeliefState& s, int prim) const;
+    std::array<float, 2> responsibilities(const Eigen::Vector3f& p, const DoorBeliefState& s, float R) const;
+    // Fixed template prior on w,h folded into the SAME GN normal equations as the data (engine detects this
+    // hook via a C++23 requires). Pulls w→tpl_w, h→tpl_h with precision 1/prior_{w,h}_std² each frame; s is
+    // untouched (it carries only the broad temporal prior). This is what makes the strong size prior stick.
+    void accumulate_extra(const DoorBeliefState& s, const DoorFrame& frame,
+                          Eigen::Matrix<float, 3, 3>& Id, Eigen::Matrix<float, 3, 1>& bd) const;
+
+    // Mean per-point mixture NEGATIVE LOG-LIKELIHOOD of `pts` (includes clutter) — the multi-instance
+    // ASSOCIATION evidence. A far / wrong-instance slice (all points → flat clutter) → tiny likelihood →
+    // HIGH nll → not claimed (unlike mean_energy, which scores it ~0).
+    float association_nll(const std::vector<Eigen::Vector3f>& pts, float R) const;
+    // Mean per-point mixture NLL at an ARBITRARY state — the proper likelihood used e.g. by the fitter.
+    float mixture_nll(const std::vector<Eigen::Vector3f>& pts, const DoorBeliefState& s, float R) const;
+    // Mean per-point data energy (responsibility-weighted SDF), at an ARBITRARY state.
+    float mean_energy(const std::vector<Eigen::Vector3f>& pts, const DoorBeliefState& s, float R) const;
+    // Mean clutter responsibility over the frame's points (diagnostic; off-model / contamination fraction).
+    float clutter_fraction(const std::vector<Eigen::Vector3f>& pts, float R) const;
+
+    // The wall fixes yaw, so there is no discrete-orientation ambiguity to report: the reported covariance
+    // IS the 3×3 posterior Σ over [s,w,h]. Kept as a named accessor so publish/log call sites read cleanly.
+    Eigen::Matrix<float, 3, 3> covariance_reported() const { return Sigma_; }
+
+    void  apply_constraints(DoorBeliefState& s) const;
+    void  canonicalize(DoorBeliefState&) const {}   // wall fixes yaw ⇒ no symmetry fold
+
+    int   gn_iters() const { return params_.gn_iters; }
+    int   n_prims()  const { return 1; }             // one thin panel (clutter is the +1)
+    float sigma2()   const { return params_.sigma_base_m * params_.sigma_base_m; }
+    Eigen::Matrix<float, 3, 3> transition() const { return Eigen::Matrix<float, 3, 3>::Identity(); }  // static
+    Eigen::Matrix<float, 3, 1> process_noise_diag() const;
+    Eigen::Matrix<float, 3, 1> prior_cov_diag() const;
+    Eigen::Matrix<float, 3, 1> common_mode_inv_diag(const DoorFrame& frame) const;
+
+    static bool self_test();
+
+private:
+    // Unnormalized mixture terms [panel, clutter] at p (likelihood×prior). Shared by responsibilities()
+    // (normalizes) and association_nll() (sums).
+    std::array<float, 2> mixture_unnorm(const Eigen::Vector3f& p, const DoorBeliefState& s, float R) const;
+
+    DoorBeliefState            state_;
+    DoorBeliefParams           params_;
+    Eigen::Matrix<float, 3, 3> Sigma_ = Eigen::Matrix<float, 3, 3>::Identity();
+    Eigen::Matrix<float, 3, 1> prior_mean_ = Eigen::Matrix<float, 3, 1>::Zero();
+};
+
+}  // namespace rc

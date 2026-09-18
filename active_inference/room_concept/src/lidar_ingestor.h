@@ -1,0 +1,185 @@
+/*
+ *    Copyright (C) 2026 by RoboLab at the University of Extremadura
+ *    This file is part of RoboComp
+ *
+ *    RoboComp is free software: you can redistribute it and/or modify it under
+ *    the terms of the GNU General Public License as published by the Free
+ *    Software Foundation, either version 3 of the License, or (at your option)
+ *    any later version. See <http://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+// LidarIngestor — media-plane LiDAR acquisition for room_concept.
+//
+// Drains robot_concept's zero-copy LidarFrame stream synchronously via pump(), called once per
+// compute cycle from the compute thread: it fills the HighLidarBuffer the localizer reads and wakes
+// the localizer (RoomConcept::notify_new_lidar). No dedicated ingest thread and no DSR-graph path —
+// a single-caller non-blocking poll() is the one thread-safe procedure every agent uses to read the
+// media infrastructure (mirrors the retina's SceneProcessor::get_lidar3D()). The earlier
+// CV/signal/watchdog ingest-thread scaffolding was crash-hunting for what turned out to be the Eigen
+// alignment ABI bug (now fixed), so it is gone.
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <genericworker.h>          // DSR API
+
+#include "buffer_types.h"           // rc::HighLidarBuffer, rc::LidarData (+ Eigen)
+#include "room_concept.h"           // rc::RoomConcept (notify_new_lidar)
+#include "room_config.h"            // rc::RoomConfig (shared config)
+
+namespace DSR { class InnerEigenAPI; }
+namespace rc::media { class LidarPlaneReader; }
+
+namespace rc
+{
+
+class LidarIngestor
+{
+public:
+    // Lightweight: stores deps + creates the room-side buffer. The DDS subscriber is
+    // NOT created here — it is brought up lazily in pump() once the "helios" node +
+    // its media descriptor exist, reading the DDS domain/topic from that JSON (no config).
+    LidarIngestor(std::shared_ptr<DSR::DSRGraph> graph, rc::RoomConcept& room_concept,
+                  const rc::RoomConfig& params);
+    ~LidarIngestor();
+    LidarIngestor(const LidarIngestor&) = delete;
+    LidarIngestor& operator=(const LidarIngestor&) = delete;
+
+    // Start/stop the dedicated ingest thread. START ONLY once the agent is Operating (post graph-join):
+    // the thread reads the DSR graph (subscriber discovery + inner_eigen device→robot transform), and
+    // touching the graph during the join window corrupts it — same rule as compute(). Idempotent.
+    // stop() joins the thread; it is also called by the destructor, which the owner must invoke while G
+    // and RoomConcept are still alive (see SpecificWorker teardown).
+    void start();
+    void stop();
+
+    // Drain the media plane (non-blocking), push the newest scan to the buffer + wake the localizer.
+    // Returns true if a fresh scan was ingested. Runs on the ingest thread; exposed for tests.
+    bool pump();
+
+    // The localizer reads its lidar from here (also wired into RoomConcept::RunContext).
+    [[nodiscard]] rc::HighLidarBuffer& buffer() noexcept { return high_lidar_buffer_; }
+
+    // ── Stream liveness, for the Waiting/Operating gate ────────────────────────────────────────
+    // Without LiDAR the localizer can never stabilize, so the agent must not sit in Operating
+    // pretending to work. These are the two questions the state machine asks.
+
+    // (a) BEFORE any DDS exists: is the media plane even advertised? Pure DSR-graph read (sensor node
+    //     + its media descriptor + a "lidar" stream in it), so it is safe to call from Waiting on the
+    //     main thread — no participant is created, which is what the media-plane rule requires.
+    //     `detail` (optional) receives a human-readable reason when it returns false.
+    [[nodiscard]] bool stream_descriptor_available(std::string* detail = nullptr) const;
+
+    // (b) ONCE Operating: are frames actually arriving? Wall-clock ms since the last sweep reached the
+    //     buffer, or -1 if none ever has. A live descriptor with a silent producer still reads -1/large.
+    [[nodiscard]] std::int64_t ms_since_last_frame() const noexcept;
+
+private:
+    // Ingest-thread body: tightly paced poll of the reader so a fresh scan reaches the localizer with
+    // ~0-2 ms latency instead of waiting for the next ~16 ms compute() tick. Sleeps briefly (woken on
+    // stop) when no new frame is available, so it is not a hard spin.
+    void ingest_loop();
+    void ingest_scan(std::vector<Eigen::Vector3f>&& points_high, std::int64_t src_ts);
+
+    // One-shot startup geometry self-check (ingest thread only). Accumulates a z-histogram of the
+    // first LIDAR_STARTUP_CHECK_SWEEPS body-frame sweeps, then: (a) locates the floor plane and warns
+    // if it disagrees with the mount geometry (RT root<-body vs body<-helios) -> a wrong mount height;
+    // (b) locates the ceiling plane and caps high_max_z_ at ceiling - margin so only upper-wall points
+    // reach the localizer. Re-armed by start() so it re-runs on each Operating entry.
+    void accumulate_geometry_sample(const std::vector<Eigen::Vector3f>& sweep_body);
+    void run_startup_geometry_check();
+    /// The ceiling half of the geometry check, callable FOREVER: locate the ceiling plane in the
+    /// (leaky) z / z×r histograms with the annulus-vs-wall-top likelihood test and cap high_max_z_
+    /// at (ceiling − margin). One-shot at startup was not enough: a verdict taken from wherever the
+    /// robot happened to boot froze the band, and a missed ceiling then fed the 2-D wall model
+    /// interior rings for the rest of the run (the wall-SLAM hairball). Logs on VERDICT CHANGE only.
+    void update_ceiling_cap(bool startup);
+
+    std::shared_ptr<DSR::DSRGraph> G_;
+    rc::RoomConcept*      room_concept_ = nullptr;
+    const rc::RoomConfig* params_       = nullptr;
+    // Shared media-plane consumer: prefers the "helios" high plane (DEVICE frame), transformed to the
+    // robot base ("body") via the DSR RT tree. Same reader
+    // every agent uses. inner_eigen_ backs its RT queries and must outlive it.
+    std::unique_ptr<DSR::InnerEigenAPI>          inner_eigen_;
+    std::unique_ptr<rc::media::LidarPlaneReader> reader_;
+
+    rc::HighLidarBuffer high_lidar_buffer_{3};
+    std::int64_t last_ingested_lidar_ts_ = std::numeric_limits<std::int64_t>::min();
+
+    // Runtime upper bound of the high band (m, body frame). Starts at LIDAR_HIGH_MAX_HEIGHT and is
+    // lowered to (detected ceiling - margin) by the startup check. Ingest-thread only, so plain float.
+    float high_max_z_ = 0.f;
+public:
+    /// THE MEASURED CEILING HEIGHT (m, body frame) and how many returns voted for it, or 0 when the
+    /// check has not yet said CEILING. The check already locates the plane — it found 3.01 m against
+    /// a stated 3.00 on the apartamento — but until 2026-09-03 the number was used only to cap the
+    /// wall band and was then discarded, while everything that needs a ceiling read a hand-typed
+    /// constant. Written by the ingest thread, read by anyone: atomic, and only ever set to a value
+    /// the likelihood test accepted.
+    std::atomic<float> measured_ceiling_z_{0.f};
+    std::atomic<int>   measured_ceiling_pts_{0};
+    /// The ceiling plane's own SPREAD in metres, floored at the histogram's resolution — an honest
+    /// uncertainty for the height, not a standard error. See update_ceiling_cap for why a leaky
+    /// histogram's count must not be treated as a sample size. 0 = never measured.
+    std::atomic<float> measured_ceiling_sigma_{0.f};
+private:
+    // Startup geometry-check state (ingest thread only; re-armed by start()).
+    bool  geom_check_done_ = false;
+    int   geom_sweeps_     = 0;
+    // Helios z-histogram (walls/ceiling; floor is grazing/high). LEAKY floats: after the startup
+    // check these stay alive, decayed per sweep, so the ceiling verdict can be re-taken as the robot
+    // moves (~20 s memory). ⚠ the leak is a time constant.
+    std::vector<float> geom_hist_;
+    // Joint (z-bin × horizontal-radius-bin) helios histogram, for the ceiling perimeter-vs-interior test:
+    // a real ceiling fills the interior (returns CLOSER than the walls), a wall-top ring sits at the wall
+    // range. Row-major [z_bin * GEOM_NR + r_bin]. Same leaky lifetime as geom_hist_.
+    std::vector<float> geom_rz_hist_;
+    static constexpr float kGeomLeak = 0.995f;      // per sweep (~200-sweep memory)
+    static constexpr int   kCeilRecheckSweeps = 100; // re-take the ceiling verdict every ~5-10 s
+    int   ceil_recheck_counter_ = 0;
+    int   last_ceiling_verdict_ = -9;                // -9 never, 1 ceiling, 0 wall-top, 2 inconclusive, 3 none
+    float last_ceiling_cap_     = -1.f;
+    std::optional<double> geom_base_z_;              // root<-robot height cached at startup
+    // bpearl (downward dome) is the HEAD-ON floor sensor — its own z-histogram is the floor calibration
+    // datum. Comes up later than helios → warm-up counter; separate reader dropped after the check.
+    int   geom_bpearl_sweeps_ = 0;
+    std::vector<int> geom_hist_bpearl_;
+    std::unique_ptr<rc::media::LidarPlaneReader> geom_bpearl_reader_;
+
+    // Dedicated ingest thread (started at Operating-enter, joined in stop()/dtor).
+    std::thread             thread_;
+    std::atomic<bool>       running_{false};
+    std::mutex              wake_mutex_;
+    std::condition_variable wake_cv_;
+
+    // Source-attribution telemetry (ingest thread only): 5 s "[LidarSrc]" log.
+    std::uint64_t fresh_frames_      = 0;   // LidarFrames drained from the plane
+    std::uint64_t served_            = 0;   // scans actually pushed to the buffer
+    /// Band-composition telemetry. The high band is selected by two HEIGHTS, but which points those
+    /// two heights select depends on the sensor's FAN — invert the helios and the same two numbers
+    /// pick near walls at steep elevation instead of far walls at shallow. Nothing downstream can
+    /// show that: every number after this point reports the FIT, not what was fitted.
+    long band_sweeps_ = 0, band_in_ = 0, band_total_ = 0;
+    double band_z_sum_ = 0.0, band_r_sum_ = 0.0;
+    float band_z_lo_ = 1e9f, band_z_hi_ = -1e9f;
+    std::array<long, 6> band_zhist_{};   ///< where in the band, in sixths
+    std::int64_t band_report_ms_ = 0;
+    std::int64_t  last_src_report_ms_ = 0;
+
+    // Wall-clock stamp (ms since epoch) of the last sweep pushed to the buffer, 0 = never. Written on
+    // the ingest thread, read by the state machine on the main thread ⇒ atomic.
+    std::atomic<std::int64_t> last_frame_wall_ms_{0};
+};
+
+}  // namespace rc

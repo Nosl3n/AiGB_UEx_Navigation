@@ -1,0 +1,341 @@
+#VRML_SIM R2023b utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+
+WorldInfo {
+  info [
+    "Simulation of the ROBOLAB shadow robot."
+  ]
+  title "ROBOLAB shadow"
+  basicTimeStep 16
+  contactProperties [
+    ContactProperties {
+      material1 "InteriorWheelMat"
+      coulombFriction [
+        0, 2, 0
+      ]
+      frictionRotation -0.785398 0
+      bounce 0
+      forceDependentSlip [
+        10, 0
+      ]
+    }
+    ContactProperties {
+      material1 "ExteriorWheelMat"
+      coulombFriction [
+        0, 2, 0
+      ]
+      frictionRotation 0.785398 0
+      bounce 0
+      forceDependentSlip [
+        10, 0
+      ]
+    }
+  ]
+}
+Viewpoint {
+  orientation 0.563941914600004 -0.16630886692000843 -0.8088948496195689 3.3187123568002352
+  position 11.19054255284089 2.758729785332422 30.061946004949537
+}
+DEF HUMAN_1 Robot {
+  translation -1.78725 2.15008 3.30402e-13
+  rotation 0 0 1 -1.5707953071795862
+  children [
+    Lidar {
+      translation 0 0 1.17
+      numberOfLayers 1
+      maxRange 10
+    }
+    Shape {
+      appearance PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "../protos/meshes/Sandra_custom/sandra_eyebrow.png"
+          ]
+        }
+        roughness 1
+        metalness 0
+      }
+      geometry Mesh {
+        url [
+          "../protos/meshes/Sandra_custom/Sandra.dae"
+        ]
+        materialIndex 0
+      }
+    }
+    Shape {
+      appearance PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "../protos/meshes/Sandra_custom/sandra_eyes.jpg"
+          ]
+        }
+        roughness 1
+        metalness 0
+      }
+      geometry Mesh {
+        url [
+          "../protos/meshes/Sandra_custom/Sandra.dae"
+        ]
+        materialIndex 1
+      }
+    }
+    Shape {
+      appearance PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "../protos/meshes/Sandra_custom/sandra_hair.png"
+          ]
+        }
+        roughness 1
+        metalness 0
+      }
+      geometry Mesh {
+        url [
+          "../protos/meshes/Sandra_custom/Sandra.dae"
+        ]
+        materialIndex 2
+      }
+    }
+    Shape {
+      appearance PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "../protos/meshes/Sandra_custom/sandra_shoes.jpg"
+          ]
+        }
+        roughness 1
+        metalness 0
+      }
+      geometry Mesh {
+        url [
+          "../protos/meshes/Sandra_custom/Sandra.dae"
+        ]
+        materialIndex 3
+      }
+    }
+    Shape {
+      appearance PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "../protos/meshes/Sandra_custom/sandra_skin.jpg"
+          ]
+        }
+        roughness 1
+        metalness 0
+      }
+      geometry Mesh {
+        url [
+          "../protos/meshes/Sandra_custom/Sandra.dae"
+        ]
+        materialIndex 4
+      }
+    }
+    Shape {
+      appearance PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "../protos/meshes/Sandra_custom/sandra_suit.jpg"
+          ]
+        }
+        roughness 1
+        metalness 0
+      }
+      geometry Mesh {
+        url [
+          "../protos/meshes/Sandra_custom/Sandra.dae"
+        ]
+        materialIndex 5
+      }
+    }
+  ]
+  name "HUMAN_1(2)"
+  controller "human_keyboard_controlled"
+  supervisor TRUE
+}
+TexturedBackground {
+  texture "noon_park_empty"
+}
+TexturedBackgroundLight {
+  luminosity 0.6
+}
+DEF shadow Shadow {
+}
+Group {
+  children [
+    Solid {
+      children [
+        Shape {
+          appearance PBRAppearance {
+            roughness 1
+            metalness 0
+          }
+          geometry Mesh {
+            url [
+              "FourRoom_meshes/walls_3.dae"
+            ]
+          }
+        }
+      ]
+      name "solid(7)"
+      boundingObject Mesh {
+        url [
+          "FourRoom_meshes/walls_3.dae"
+        ]
+      }
+    }
+    Solid {
+      children [
+        Shape {
+          appearance PBRAppearance {
+            roughness 1
+            metalness 0
+          }
+          geometry Mesh {
+            url [
+              "FourRoom_meshes/walls_2.dae"
+            ]
+          }
+        }
+      ]
+      name "solid(6)"
+      boundingObject Mesh {
+        url [
+          "FourRoom_meshes/walls_2.dae"
+        ]
+      }
+    }
+    Solid {
+      children [
+        Shape {
+          appearance PBRAppearance {
+            roughness 1
+            metalness 0
+          }
+          geometry Mesh {
+            url [
+              "FourRoom_meshes/walls_1.dae"
+            ]
+          }
+        }
+      ]
+      name "solid(5)"
+      boundingObject Mesh {
+        url [
+          "FourRoom_meshes/walls_1.dae"
+        ]
+      }
+    }
+    Solid {
+      children [
+        Shape {
+          appearance PBRAppearance {
+            roughness 1
+            metalness 0
+          }
+          geometry Mesh {
+            url [
+              "FourRoom_meshes/walls.dae"
+            ]
+            materialIndex 0
+          }
+        }
+      ]
+      name "solid(4)"
+      boundingObject Mesh {
+        url [
+          "FourRoom_meshes/walls.dae"
+        ]
+      }
+    }
+    Solid {
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.862745 0.541176 0.866667
+            roughness 1
+            metalness 0
+          }
+          geometry Mesh {
+            url [
+              "FourRoom_meshes/floor_3.dae"
+            ]
+          }
+        }
+      ]
+      name "solid(3)"
+      boundingObject Plane {
+        size 100 100
+      }
+    }
+    Solid {
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.976471 0.941176 0.419608
+            roughness 1
+            metalness 0
+          }
+          geometry Mesh {
+            url [
+              "FourRoom_meshes/floor_2.dae"
+            ]
+          }
+        }
+      ]
+      name "solid(2)"
+    }
+    Solid {
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.560784 0.941176 0.643137
+            roughness 1
+            metalness 0
+          }
+          geometry Mesh {
+            url [
+              "FourRoom_meshes/floor_1.dae"
+            ]
+          }
+        }
+      ]
+      name "solid(1)"
+    }
+    Solid {
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.6 0.756863 0.945098
+            roughness 1
+            metalness 0
+            emissiveIntensity 0
+          }
+          geometry Mesh {
+            url [
+              "FourRoom_meshes/floor.dae"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
+Solid {
+  translation -7.96082e-07 0.77 2.95
+  rotation 0 1 0 3.14159
+  children [
+    Shape {
+      appearance PBRAppearance {
+        roughness 1
+        metalness 0
+      }
+      geometry Plane {
+        size 20 20
+      }
+      castShadows FALSE
+    }
+  ]
+  name "ceiling"
+}

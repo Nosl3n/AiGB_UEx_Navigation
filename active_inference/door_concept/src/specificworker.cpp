@@ -1,0 +1,3601 @@
+/*
+ *    Copyright (C) 2026 by RoboComp CORTEX Team
+ *
+ *    This file is part of RoboComp
+ *
+ *    RoboComp is free software: you can redistribute it and/or modify
+ *    it under the terms of the GNU General Public License as published by
+ *    the Free Software Foundation, either version 3 of the License, or
+ *    (at your option) any later version.
+ *
+ *    RoboComp is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU General Public License for more details.
+ *
+ *    You should have received a copy of the GNU General Public License
+ *    along with RoboComp.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/**
+ * SpecificWorker — door_concept agent
+ *
+ * Implements the Active Inference loop described in ../CONCEPT_AGENT_RECIPE.md:
+ *
+ *  ① Read sensing attributes from DSR door nodes
+ *  ② Update the historical sample queue with fresh near-surface candidates
+ *  ③ Run gradient-descent steps on the 7-param generative model (SDF + FE)
+ *  ④ Write updated model parameters back to DSR (RT edge + geometry attrs)
+ *  ⑤ Check convergence and set model_stable_att
+ *  ⑥ Compute epistemic action proposals (viewpoint → mission-controller)
+ *  ⑦ Detect divergence and set request_full_sample_att
+ */
+
+#include "specificworker.h"
+
+#include "../../common/detectability/detectability.h"   // rc::detect — the YOLO inverse model
+#include "../../common/contour_edge/contour_edge_check.h"   // rc::edges — classifier-free check
+#include "../../common/contour_edge/contour_depth_check.h"  // rc::edges — its metric half
+#include "../../common/detect_probe/detect_probe.h"   // rc::probe — the detector's truth table (SHARED)
+
+#include "../../common/diag_log/rotating_csv.h"   // keep the previous run instead of wiping it
+
+#include "../../common/dashboard/belief_certainty.h"   // rc::dash::fill_certainty (SHARED)
+
+#include "../../common/obj/convergence.h"   // rc::converge::step (SHARED)
+
+#include "../../common/dashboard/belief_series.h"   // rc::dash::publish_belief_series (SHARED)
+
+#include "../../common/birth_surprise/residual_field_reader.h"   // rc::read_residual_field (SHARED)
+
+#include "../../common/peripheral_channel/peripheral_channel.h"   // THE shared ricoh path
+#include "../../common/exclusion/exclusion.h"   // rc::exclusion — the SHARED no-two-objects rule
+#include "../../common/exclusion/exclusion.h"   // rc::exclusion:: (SHARED)
+
+#include "../../common/footprint/footprint.h"   // rc::geom:: Footprint / overlap_ratio (SHARED)
+#include "../../common/track/merge_instances.h"   // rc::track::merge_overlapping — the SHARED merge sweep
+#include "../../common/instance_tracker/birth_evidence.h"   // rc::birth:: the shared CREATE policy
+#include "../../common/nbv/graph_obstacles.h"   // rc::nbv::collect_graph_obstacles — shared, DSR-side
+#include "door_dof.h"   // rc::kDoorDofs — names/units for the BeliefInspector rows
+
+#include <limits>   // numeric_limits<int>::max — the disabled tracker death counter
+#include <QTimer>
+#include <QSettings>   // persist the standalone dashboard window geometry
+#include <QByteArray>
+#include <QFont>
+#include <QFontMetrics>
+#include <QHBoxLayout>
+#include <QPushButton>
+#include <QLabel>
+#include <QComboBox>
+#include <QVBoxLayout>
+#include <QDateTime>   // wall-clock ms for the primary-input (masks) stream gate
+#include <filesystem>
+#include <print>
+#include <cstdlib>   // std::_Exit — crash-free terminal shutdown
+#include <thread>    // brief DDS flush before _Exit
+#include <chrono>
+#include <fstream>   // per-cycle detection-slice diagnostic CSV
+#include <charconv>  // locale-independent parsing of etc/door_identities.csv (CLAUDE.md)
+#include <locale>    // classic-locale writers
+#include <format>
+#include <iostream>  // std::cout/cerr flush
+
+#include <algorithm>
+#include <cmath>
+#include <sstream>
+#include <array>
+#include <vector>
+#include <unordered_set>
+
+// DSR attribute name tags — generated from dsr_attr_name.h
+#include <dsr/api/dsr_api.h>
+
+namespace {
+
+// Scalar model-uncertainty readout for model_uncertainty_att / the dashboard: the sum of the belief's
+// per-DOF posterior stds from the AI2 covariance Σ over the wall-frame [s,w,h] (along-wall offset + panel
+// width + height). Shrinks as the robot gathers viewpoints (mostly s, as the door is localised).
+float belief_uncertainty(const rc::DoorInstance& inst)
+{
+    if (not inst.ai2_initialized)
+        return 0.0f;
+    const auto& S = inst.ai2_belief.covariance();
+    const auto sd = [&](int i) { return std::sqrt(std::max(0.0f, S(i, i))); };
+    return sd(0) + sd(1) + sd(2);
+}
+
+// Two doors cannot share physical space. Footprint = the oriented APERTURE rectangle in the room plane;
+// these helpers compute the overlap area so the merge operator can collapse duplicate instances.
+// The APERTURE, not the leaf: duplicates of one physical door are duplicates of one HOLE, and two
+// hypotheses that disagree about phi would stop overlapping as leaves while still being the same door.
+// Corners CCW (local order (-,-),(+,-),(+,+),(-,+)). Mirrors table_concept.
+// ─── Footprint geometry: the plane maths is SHARED (common/footprint) ────────────────────────────
+// These were FIVE BYTE-IDENTICAL copies across the fleet (100.0% pairwise, character for character), and
+// they answer "are these two instances the same physical object?" for merge_overlapping_instances — a
+// lifecycle decision with exactly the profile decide_removal had before it drifted three ways. Only the
+// per-object part stays: how a DOOR names its two footprint extents.
+// ★A DOOR'S FOOTPRINT IS ITS APERTURE, NOT ITS LEAF — (ap_cx, ap_cy, ap_yaw) with the panel width across
+// and the panel THICKNESS as the second extent. Two doors are the same door when their apertures coincide;
+// a swung leaf moves while the aperture does not, so merging on the leaf would split one door in two every
+// time it opened. That is a genuine per-object mapping and it is exactly what this adapter is for.
+// Point-in-convex-quad, by consistent sign of the cross product around the loop. The quads here come
+// straight from door_geometry (leaf or aperture), so they are convex and correctly ordered by
+// construction — no general polygon test is warranted.
+static bool point_in_quad(const std::array<Eigen::Vector2f, 4>& q, const Eigen::Vector2f& p)
+{
+    int pos = 0, neg = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        const Eigen::Vector2f& a = q[static_cast<std::size_t>(i)];
+        const Eigen::Vector2f& b = q[static_cast<std::size_t>((i + 1) % 4)];
+        const float cr = (b.x() - a.x()) * (p.y() - a.y()) - (b.y() - a.y()) * (p.x() - a.x());
+        if (cr > 0.f) ++pos; else if (cr < 0.f) ++neg;
+    }
+    return pos == 0 or neg == 0;
+}
+
+static rc::geom::Footprint footprint_of(const rc::DoorState& s)
+{ return { s.ap_cx, s.ap_cy, s.w, s.thickness, s.ap_yaw }; }
+
+float footprint_overlap_ratio(const rc::DoorState& a, const rc::DoorState& b)
+{ return rc::geom::overlap_ratio(footprint_of(a), footprint_of(b)); }
+
+// Tracker lifecycle event log (etc/door_events.csv) — makes birth/merge/prune/suppress visible so the
+// "create then remove" churn can be diagnosed from a file, not stdout. seq gives ordering.
+void log_tracker_event(const char* ev, std::uint64_t id, float x, float y, const std::string& note)
+{
+    static std::ofstream f = [] { std::ofstream o; rc::diag::open_rotating(o, "etc/door_events.csv");
+                                   o << "seq,event,id,x,y,note\n"; return o; }();
+    static int seq = 0;
+    f << seq++ << ',' << ev << ',' << id << ',' << x << ',' << y << ',' << note << '\n';
+    f.flush();
+}
+
+}  // namespace
+
+
+// ─── Constructor / Destructor ─────────────────────────────────────────────────
+
+SpecificWorker::SpecificWorker(const ConfigLoader& configLoader,
+                               TuplePrx tprx,
+                               bool startup_check)
+    : GenericWorker(configLoader, tprx),
+      startup_check_flag(startup_check)
+{
+    if (startup_check_flag)
+    {
+        this->startup_check();
+        return;
+    }
+
+    // Startup sanity check of the wall-frame [s,w,h] belief AND the aperture/leaf geometry (mirrors
+    // bottle_concept). Non-fatal — but say so loudly rather than discarding the result, because a FAIL here
+    // means every SDF, silhouette and projected ROI downstream is computed against the wrong panel.
+    if (not rc::DoorBelief::self_test())
+        std::print("door_concept: *** DoorBelief::self_test FAILED — panel geometry is NOT trustworthy ***\n");
+
+    load_config(configLoader);
+
+    const int period = configLoader.get<int>("Period.Compute");
+
+    states["Waiting"] = std::make_unique<GRAFCETStep>("Waiting", period,
+        std::bind(&SpecificWorker::waiting_loop, this),
+        std::bind(&SpecificWorker::waiting_enter, this));
+    states["Operating"] = std::make_unique<GRAFCETStep>("Operating", period,
+        std::bind(&SpecificWorker::operating_loop, this),
+        std::bind(&SpecificWorker::operating_enter, this));
+    states["Degraded"] = std::make_unique<GRAFCETStep>("Degraded", period,
+        std::bind(&SpecificWorker::degraded_loop, this),
+        std::bind(&SpecificWorker::degraded_enter, this));
+
+    // Compute → Waiting on start
+    states["Compute"]->addTransition(states["Compute"].get(), SIGNAL(entered()), states["Waiting"].get());
+    // Waiting → Operating when all required peers are ready
+    states["Waiting"]->addTransition(this, SIGNAL(presenceReady()), states["Operating"].get());
+    // Operating → Degraded when a required peer is lost
+    states["Operating"]->addTransition(this, SIGNAL(presenceLost()), states["Degraded"].get());
+    // Degraded → Waiting immediately (self-kill scheduled inside degraded_enter)
+    states["Degraded"]->addTransition(states["Degraded"].get(), SIGNAL(entered()), states["Waiting"].get());
+
+    statemachine.addState(states["Waiting"].get());
+    statemachine.addState(states["Operating"].get());
+    statemachine.addState(states["Degraded"].get());
+
+    statemachine.setChildMode(QState::ExclusiveStates);
+    statemachine.start();
+
+    const auto err = statemachine.errorString();
+    if (err.length() > 0)
+    {
+        qWarning() << err;
+        throw err;
+    }
+}
+
+SpecificWorker::~SpecificWorker()
+{
+    request_shutdown();
+    std::print("door_concept: SpecificWorker destroyed.\n");
+}
+
+void SpecificWorker::request_shutdown()
+{
+    if (shutting_down_.exchange(true))
+        return;
+
+    // ★SEVER THE GRAPH CALLBACKS BEFORE ANY TEARDOWN. This agent connects del_node_signal to del_node_slot,
+    // and cleanup_owned_nodes() below calls G->delete_node() — from the MAIN thread, where emitter and
+    // receiver share a thread and Qt's Auto connection therefore resolves to DIRECT. So the slot re-enters
+    // synchronously while the object is being torn down. bottle_concept severed the callbacks here and
+    // wrote down the symptom it was fixing ("a del_node delta ... on this already-destructing object — the
+    // exit segfault"); the other six kept the connection live. Dropping inner_eigen_ afterwards (while G is
+    // still fully alive) also unsubscribes its internal graph signals cleanly.
+    if (G)
+        disconnect(G.get(), nullptr, this, nullptr);
+
+    save_window_settings();
+    save_dashboard_geometry();
+    save_strip_geometry();       // …nor is the compact belief strip   // the standalone dashboard is not in `windows`, so save it explicitly
+
+    cleanup_owned_nodes();
+
+    // Drop the InnerEigenAPI now (the fitter only holds a raw pointer and is null-guarded): letting it
+    // destruct later with the rest of the object can fault inside DSR. Mirrors bottle_concept.
+    inner_eigen_.reset();
+}
+
+void SpecificWorker::terminal_shutdown()
+{
+    static std::atomic<bool> terminating{false};
+    if (terminating.exchange(true))
+        return;   // _Exit is coming; never run this twice
+
+    // SHARED (common/agent_exit) — the reasoning for every step, including why G->reset() cannot be skipped,
+    // now lives with the code instead of in seven copies of the same comment block.
+    rc::agent::terminal_exit([this] { request_shutdown(); },
+                             [this] { if (G) G->reset(); });
+}
+
+// Persist/restore the standalone dashboard window's geometry. The generated save_window_settings()
+// only covers the QMainWindow(s) in `windows`; our extracted top-level widget is separate, so we
+// carry its own QSettings entry (mirrors room_concept's RoomViewer).
+void SpecificWorker::restore_dashboard_geometry()
+{
+    if (not dashboard_window_)
+        return;
+    QSettings settings(QStringLiteral("RoboComp"), QStringLiteral("door_concept"));
+    const QByteArray geom = settings.value(QStringLiteral("DashboardWindow_geometry")).toByteArray();
+    if (not geom.isEmpty())
+        dashboard_window_->restoreGeometry(geom);
+    else
+        dashboard_window_->resize(1180, 900);
+}
+
+void SpecificWorker::save_dashboard_geometry() const
+{
+    if (not dashboard_window_)
+        return;
+    QSettings settings(QStringLiteral("RoboComp"), QStringLiteral("door_concept"));
+    settings.setValue(QStringLiteral("DashboardWindow_geometry"), dashboard_window_->saveGeometry());
+    settings.sync();
+}
+
+// ─── Compact belief strip ────────────────────────────────────────────────────────────────────────
+
+// One row per instance: the certainty channel (adequacy gap in nats, or ½·ln|Σ| when this agent
+// publishes no σ*), p(existence), the FE surprise, and the node's birth stamp. The widget owns the
+// history — this only pushes the current instant, on the same ~5 Hz tick as the panels above.
+void SpecificWorker::refresh_belief_strip()
+{
+    // The loop, the REPORTED covariance, the creation-stamp birth time and update_view() are SHARED
+    // (common/dashboard/belief_strip.h). What stays is what only this agent knows: where p_exists
+    // comes from and which DOF table describes the belief.
+    rc::dash::fill_strip(belief_strip_, fitter_->instances(), *G,
+        [](rc::BeliefStripRow& r, const auto& inst)
+        {
+            if (inst.existence_seeded) r.p_exists = inst.existence.p_exists();
+            rc::dash::fill_certainty(r, inst.ai2_belief.covariance_reported(), rc::kDoorDofs);
+        });
+}
+
+void SpecificWorker::restore_strip_geometry()
+{
+    if (not strip_window_)
+        return;
+    QSettings settings(QStringLiteral("RoboComp"), QStringLiteral("door_concept"));
+    const QByteArray geom = settings.value(QStringLiteral("BeliefStripWindow_geometry")).toByteArray();
+    if (not geom.isEmpty())
+        strip_window_->restoreGeometry(geom);
+    else
+        strip_window_->resize(520, 210);   // small ON PURPOSE — meant to sit in a corner, always open
+}
+
+void SpecificWorker::save_strip_geometry() const
+{
+    if (not strip_window_)
+        return;
+    QSettings settings(QStringLiteral("RoboComp"), QStringLiteral("door_concept"));
+    settings.setValue(QStringLiteral("BeliefStripWindow_geometry"), strip_window_->saveGeometry());
+    settings.sync();
+}
+
+
+// ─── Initialisation ──────────────────────────────────────────────────────────
+
+void SpecificWorker::initialize()
+{
+    std::print("door_concept: initialize()\n");
+
+    // Shadow-mode birth/death record (CONCEPT_AGENT_LIFECYCLE.md §4.2). Recording only — see
+    // log_phantom_event(). Truncating: one file per run.
+    phantom_log_.open("etc/door_phantom_events.csv");
+    GenericWorker::initialize();
+ 
+    // Ignore payload attributes in local graph updates to avoid unnecessary copying and processing of potentially large data
+    G->set_ignored_attributes<cam_rgb_att, cam_depth_att, laser_X_att, laser_Y_att, laser_Z_att>();
+    qInfo() << "Ignoring DSR RGBD payload attributes cam_rgb/cam_depth in local graph updates";
+
+
+    if (not G)
+    {
+        qWarning() << "door_concept: DSR graph not available in initialize()";
+        return;
+    }
+
+    // ★THE WHOLE PRESENCE PROTOCOL IS SHARED (common/concept_presence). The 134 lines that used to sit here
+    // were byte-identical across hood/refrigerator/table and differed elsewhere only in comment wording — while
+    // hiding two agents that had SILENTLY DROPPED a rule (chair and door swept their own live affordances on
+    // every Degraded bounce). The four rules it encodes, and the gate state the transitions own
+    // (operating_since_ms / stall_reported / degraded_from_input / first_operating_done), now live with the code
+    // that enforces them; only the seams below are this agent's.
+    presence_protocol_.wire(
+        presence_coordinator_, &statemachine, this, configLoader, G, static_cast<std::uint32_t>(agent_id),
+        {
+            .shutting_down      = [this] { return shutting_down_.load(); },
+            // This agent POLLS a graph node for its primary input (no free-running reader thread), so the
+            // ingest must be pumped while Waiting or liveness never advances.
+            .pump_primary_input = [this] { if (mask_ingestor_) mask_ingestor_->refresh(); },
+            .primary_age_ms     = [this] { return mask_ingestor_ ? mask_ingestor_->ms_since_last_frame() : -1; },
+            .primary_live       = [this] { return masks_stream_live(); },
+            .primary_stalled    = [this](std::int64_t *age) { return masks_stream_stalled(age); },
+            .emit_ready         = [this] { emit presenceReady(); },
+            .emit_lost          = [this] { emit presenceLost(); },
+            .compute            = [this] { compute(); },
+            .terminal_shutdown  = [this] { terminal_shutdown(); },
+            // One-shot, POST-SYNC: leftovers from a crashed previous run. The initialize() sweep can run before
+            // those nodes arrive from the persistent DSR server, and this fires before the first compute().
+            .on_first_operating = [this] { remove_stale_affordance_nodes(); },
+            .on_optional_peer_lost  = [this](const std::string &name, std::uint32_t id)
+                                      { on_optional_peer_lost(name, id); },
+            .on_optional_peer_ready = [this](const std::string &name, std::uint32_t id)
+                                      { on_optional_peer_ready(name, id); },
+        });
+
+    QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit,
+                     this, &SpecificWorker::terminal_shutdown, Qt::UniqueConnection);
+
+    rt_api_ = G->get_rt_api();
+    inner_eigen_ = G->get_inner_eigen_api();
+    mask_ingestor_ = std::make_unique<rc::MaskIngestor>(G);
+    scene_graph_ = std::make_unique<rc::DoorSceneGraph>(
+        G, rt_api_.get(), cfg_, [this] { trigger_graph_layout_twopi(); });
+
+    // Remove any "door*" nodes left behind by a previous (crashed) run so this agent always starts
+    // from a clean slate and never adopts a stale/drifted node (the instance tracker re-births them
+    // data-driven from masks). Runs BEFORE the graph signals are connected: delete_node() fires
+    // del_node_signal synchronously, and del_node_slot dereferences fitter_ — which does not exist yet.
+    // Connecting after this sweep (and after fitter_ is built) both avoids that null-deref SIGSEGV and
+    // skips a pointless self-notification for our own cleanup deletions.
+    remove_owned_door_nodes();
+
+    // Resolve room node
+    const auto rooms = G->get_nodes_by_type("room");
+    if (not rooms.empty())
+        room_node_id_ = rooms.front().id();
+    else
+        qWarning() << "door_concept: no room node found at startup";
+
+    // Active-inference fit core. Owns the instance map; collaborates with the ingestor + scene graph.
+    fitter_ = std::make_unique<rc::DoorFitter>(
+        G, inner_eigen_.get(), cfg_, mask_ingestor_.get(), scene_graph_.get());
+    fitter_->set_central_region_frac(cfg_.exist_central_region_frac);   // existence: "is the robot looking AT it"
+
+    // Subscribe to graph signals ONLY now that fitter_ (which every slot dereferences) exists, and after
+    // the startup stale-sweep above. Cross-thread Auto resolves to Queued (never add DirectConnection).
+    // ★NOT update_node_attr_signal. It fires for EVERY attribute change on EVERY node in the shared graph —
+    // every RT pose write from robot_concept, every other agent's per-cycle attribute writes — and each
+    // emission copies a std::vector<std::string> on the DDS reader thread and queues an event to this thread.
+    // Under a churn burst (a peer restarting is enough) the queue drains slower than it fills, and the main
+    // thread then does nothing but service slots: the timer-driven compute() is starved (its log stops
+    // growing), and — the symptom that costs the most — Ctrl-C dies, because generated/main.cpp routes SIGINT
+    // through a QSocketNotifier serviced by this SAME event loop. The agent can then only be killed with -9,
+    // which cannot be caught, so every node it owns LEAKS into the shared graph.
+    // Measured 2026-08-07 on table_concept (identical subscription): main thread pegged at 100% of a core,
+    // ai2_log.csv frozen, Ctrl-C inert, right after a retina restart. CLAUDE.md already states the rule
+    // this violated: if you don't need a signal, don't connect it at all (bottle_concept connects none).
+    // The two things the slot did are now POLLED once per cycle in poll_affordance_protocol().
+    connect(G.get(), &DSR::DSRGraph::update_node_signal,
+            this, &SpecificWorker::modify_node_slot);
+    connect(G.get(), &DSR::DSRGraph::del_node_signal,
+            this, &SpecificWorker::del_node_slot);
+
+    // Part B: localization/chain covariance on the published RT edge (mirrors bottle/table).
+    gaussian_api_ = std::make_unique<DSR::InnerGaussianAPI>(G.get());
+    fitter_->set_chain_cov_source(gaussian_api_.get(), "zed", cfg_.rt_cov_add_chain);
+    // The leaf tracker's second evidence channel: the same RGB the contour check already audits
+    // existence with, now also driving the ANGLE. Wired here because the ingestor is the worker's.
+    fitter_->set_rgb_source(rgb_ingestor_.get());
+
+    // ★CREATED HERE, ON THE MAIN THREAD, AFTER THE GRAPH IS UP — the media-plane consumer rule. The
+    // ingestor itself discovers the sensor node lazily inside pump() and stays dormant (no DDS
+    // participant at all) while its precision gate is 0, so this costs nothing when switched off.
+    lidar_ingestor_ = std::make_unique<rc::ConceptLidarIngestor>(G, inner_eigen_.get(),
+        [this] { return rc::LidarGates{0.0f, 0.0f, cfg_.lidar_bpearl_precision}; });
+
+    // Build rc::EpistemicPlanner (Σ-based D-optimal NBV) with the configured stand-off.
+    epistemic_planner_ = rc::EpistemicPlanner(cfg_.obs_distance);
+    // ONE detector envelope: the viewpoint the planner asks for is the argmax of the same model absence
+    // should be weighted by. Replaces cfg_.min_standoff_m (DoorConcept.MinStandOffM), a hand-picked
+    // stand-in for the near shoulder of exactly this curve.
+    epistemic_planner_.set_detector_envelope(
+        rc::detect::DetectorEnvelope{cfg_.detect_min_fill, cfg_.detect_max_fill, cfg_.detect_soft});
+    epistemic_planner_.set_robot_radius(0.30f);   // Shadow's footprint radius
+
+    // ZED RGB consumer for the contour check. Lazily brought up inside pump() once the descriptor exists
+    // (media-plane consumer pattern); dormant while DoorConcept.RgbContourCheck is false.
+    rgb_ingestor_ = std::make_unique<rc::RgbIngestor>(G, &cfg_.rgb_contour_check, "zed");
+    depth_ingestor_ = std::make_unique<rc::DepthIngestor>(G, &cfg_.rgb_contour_check, "zed");
+
+    // DoorControl client. The endpoint is config, not compiled in: the provider is whatever can move a
+    // door here — a Webots supervisor today, home automation or a person tomorrow.
+    door_actuator_.configure(cfg_.door_control_endpoint);
+    door_registration_.load("etc/door_world_registration.csv");
+    door_registration_.solve();
+
+    // The camera's REAL geometry, read once (intrinsics and the zed mount are both static). BOTH FoVs: a door
+    // is ~2 m tall, so the VERTICAL axis binds well before the horizontal one, and the horizontal-only model
+    // this replaced was blind to it. Height from inner_eigen room->zed, NOT a body-relative constant: the room
+    // floor datum is offset from the body origin and the z-span is room-frame. ts==0 on the main thread.
+    // ★The camera model is read PER CYCLE at the compute site (rc::nbv::sensor_from_graph),
+    // NOT once here: the zed intrinsics are published by robot_concept when frames start
+    // arriving, so reading them in initialize() races the producer. Losing that race leaves
+    // vfov = 0, which silently collapses the fill model to horizontal-only — the exact bug
+    // rc::nbv exists to fix, and it drives the robot nose-to-nose with tall objects.
+
+    // Stale affordance nodes are swept on entering Operating (presence hook) and on shutdown — see
+    // remove_stale_affordance_nodes(), keyed on the parent object type (robust to node-name renames).
+
+    // Which door is which — remembered from earlier runs. Without this the numbering falls out of the order
+    // the robot happens to sweep the room, so the same door was door_1 one run and door_2 the next.
+    load_identities();
+
+    // ── Time-series dashboard — its OWN top-level window ──────────────────────
+    // Extracted from the DSR graph dock (add_custom_widget_to_dock) into a standalone window so it shows
+    // even with Agent.graph=false (this agent runs graph=false → no DSRViewer). Mirrors room_concept,
+    // kinova_controller, table_concept and bottle_concept. TimeSeriesPlot is a plain QWidget (no QOpenGL
+    // backing store), safe as a top-level. NOT WA_DeleteOnClose: closing must only HIDE it, or the
+    // ts_*_plot_ pointers the compute() feed uses would dangle. A QApplication always exists (generated/main.cpp).
+    {
+        custom_widget_ = new Custom_widget("Door — Free Energy, Surprise, Belief Uncertainty & Residuals");
+
+        // Create plot inside frame_series
+        auto* series_layout = new QVBoxLayout(custom_widget_->frame_series);
+        series_layout->setContentsMargins(0, 0, 0, 0);
+        custom_widget_->frame_series->setLayout(series_layout);
+
+        ts_plot_ = new rc::TimeSeriesPlot(custom_widget_->frame_series);
+        ts_plot_->set_visible_window(60.f);
+        series_layout->addWidget(ts_plot_, 1);
+
+        // FE SURPRISE (attention signal) on its own panel — it lives on a much smaller scale (~0–1) than
+        // the FE, so it needs the full panel height to be readable. Spikes when a door moves, decays as
+        // the fit re-converges.
+        ts_surprise_plot_ = new rc::TimeSeriesPlot(custom_widget_->frame_series);
+        ts_surprise_plot_->set_visible_window(60.f);
+        series_layout->addWidget(ts_surprise_plot_, 1);
+
+        ts_cov_plot_ = new rc::TimeSeriesPlot(custom_widget_->frame_series);
+        ts_cov_plot_->set_visible_window(60.f);
+        series_layout->addWidget(ts_cov_plot_, 1);
+
+        ts_res_plot_ = new rc::TimeSeriesPlot(custom_widget_->frame_series);
+        ts_res_plot_->set_visible_window(60.f);
+        series_layout->addWidget(ts_res_plot_, 1);
+
+
+        // BELIEF INSPECTOR — the panel that replaced the pose-σ trace. A time-series of two variances showed
+        // a slice of the belief; this shows ALL of it: every state DOF with its posterior σ, Σ as a
+        // correlation heatmap (where the structure lives), and the 4-mode yaw posterior. Stretch 2.
+        belief_inspector_ = new rc::BeliefInspector(QStringLiteral("belief inspector"),
+                                                    custom_widget_->frame_series);
+        series_layout->addWidget(belief_inspector_, 2);
+
+        // GenericWorker::initialize() may have already started compute(), so
+        // some instances can exist before the plots are constructed.
+        for (const auto& [_, inst] : fitter_->instances())
+        {
+            ts_plot_->add_series(inst.node_name + "_fe", QColor(255, 170, 0), 1.1f);
+            ts_cov_plot_->add_series(inst.node_name + "_cov", QColor(0, 190, 255), 1.1f);
+            ts_res_plot_->add_series(inst.node_name + "_res", QColor(170, 80, 255), 1.1f);
+        }
+    }
+
+    // ── Section 1: evidence-pipeline counter strip ────────────────────────────
+    evidence_monitor_ = new rc::EvidenceMonitor(QStringLiteral("door_concept — evidence monitor"));
+
+    // ── Combined window: counters (top) over the plots + belief inspector (bottom) ──
+    // Identical three-section structure to every other concept agent. Only HIDDEN on close, never deleted
+    // (compute() keeps the raw child pointers).
+    dashboard_window_ = new QWidget;
+    dashboard_window_->setWindowTitle(QStringLiteral("door_concept — dashboard"));
+    auto* outer = new QVBoxLayout(dashboard_window_);
+    outer->setContentsMargins(0, 0, 0, 0);
+    // No splitter: the counter strip is two lines of text with nothing to resize, so it simply takes
+    // its natural height and the plots + inspector get everything else.
+    outer->addWidget(evidence_monitor_, 0);   // section 1 — natural height
+    outer->addWidget(custom_widget_, 1);      // sections 2 + 3 — all remaining space
+
+    // NOT shown at startup: the strip below is the standing display and this is its drill-down,
+    // opened by the strip's "details ▸" button. Geometry is still restored, so the first click
+    // puts it back where you left it. (Want it up from the start? add `->show()`.)
+    restore_dashboard_geometry();
+
+    // ── Compact belief strip — a SEPARATE, small top-level window ──────────────────────────────────
+    // Not another panel inside the big window: the point is a display small enough to keep in a corner
+    // while the 1180×900 dashboard stays closed until something looks wrong. One row per instance, each
+    // row a 60 s trace of the certainty channel + p(existence) + FE surprise.
+    strip_window_ = new QWidget;
+    strip_window_->setWindowTitle(QStringLiteral("doors — beliefs"));
+    auto* strip_layout = new QVBoxLayout(strip_window_);
+    strip_layout->setContentsMargins(0, 0, 0, 0);
+    belief_strip_ = new rc::BeliefStrip(QStringLiteral("doors"), strip_window_);
+    belief_strip_->set_visible_window(60.f);
+    strip_layout->addWidget(belief_strip_, 1);
+
+    // "details ▸" — reveal the big dashboard on demand. A lambda connect needs no Q_OBJECT on either
+    // side, so the moc-free widget pattern is preserved; strip_window_ is the context object, so the
+    // connection dies with the window. show() alone is not enough for a minimised or buried window.
+    {
+        auto* bar = new QHBoxLayout;
+        bar->setContentsMargins(4, 0, 4, 3);
+        bar->addStretch(1);
+        auto* details = new QPushButton(QStringLiteral("details ▸"), strip_window_);
+        details->setToolTip(QStringLiteral("show / hide the full dashboard: evidence counters, FE/surprise/Σ "
+                                           "time series, and the per-DOF belief inspector"));
+        QFont bf = details->font(); bf.setPointSizeF(bf.pointSizeF() - 1.0); details->setFont(bf);
+        details->setFixedHeight(QFontMetrics(bf).height() + 8);
+        QObject::connect(details, &QPushButton::clicked, strip_window_, [this, details]()
+        {
+            if (not dashboard_window_) return;
+            // TOGGLE: the button the dashboard came out of is the button it goes back into. A drill-down
+            // that can only be OPENED is one that stays open — the 1180×900 window sits on top of
+            // everything and the only way back to a clear screen is to hunt it down in the window list and
+            // minimise it by hand (which is exactly where it was found, WM_STATE=Iconic).
+            // ★A MINIMISED window counts as PUT AWAY, not as up: otherwise the first click after
+            // minimising would "hide" an invisible window and it would take two clicks to see it again.
+            const bool up = dashboard_window_->isVisible() and not dashboard_window_->isMinimized();
+            if (up)
+                dashboard_window_->hide();
+            else
+            {
+                dashboard_window_->show();
+                dashboard_window_->setWindowState((dashboard_window_->windowState() & ~Qt::WindowMinimized)
+                                                  | Qt::WindowActive);
+                dashboard_window_->raise();
+                dashboard_window_->activateWindow();
+            }
+            // The label says what the NEXT click does. It can go stale if the window is closed from its
+            // own title bar; the state is re-read above on every click, so the behaviour never is.
+            details->setText(up ? QStringLiteral("details ▸") : QStringLiteral("◂ hide"));
+        });
+        bar->addWidget(details, 0);
+
+        // ── ASK SOMEBODY TO OPEN / CLOSE A DOOR (RoboCompDoorControl) ──────────────────────────────
+        // ★NOT "drive the simulator". The provider may be a Webots supervisor, home automation, or a
+        // person asked over TTS — the robot asks for a door to be moved and does not know or care who
+        // does it. On the real robot there is no Webots, so the dependency has to be a CAPABILITY.
+        //
+        // ★The button acts on the NEAREST believed door, and its label says which one. Acting on "the
+        // door" when several are alive would silently pick one; naming it makes a wrong pick visible
+        // before the request goes out rather than after something opens across the flat.
+        //
+        // ★Enabled state follows getCapabilities(), NOT peer presence. The Webots provider replies
+        // canActuate=false whenever its [DoorControl] Doors list is absent — the honest answer for a
+        // world whose doors are scenery — and a button that is enabled because a peer exists and then
+        // always fails teaches the operator to distrust the button. The tooltip carries the reason.
+        // ★WHICH PROVIDER DOOR. The interface offers two resolution paths: quote an advertised id, or
+        // let the provider match by PLACE. Place-matching needs our frame and the provider's world frame
+        // registered to each other, and here they are NOT — the room frame is room-local, so door_3 goes
+        // out at (-373, 4440) mm against DOOR_0 at (-3583, 7166) mm, 4 m apart, and the provider
+        // correctly answers UnknownDoor. That is a real gap and this combo does not close it; it routes
+        // around it for the case where a human is pressing the button and knows which door they mean.
+        // "(by place)" stays as the first entry so the registration path can be exercised deliberately.
+        auto* door_pick = new QComboBox(strip_window_);
+        door_pick->setToolTip(QStringLiteral("which door the PROVIDER should move: an advertised id, or "
+                                             "'(by place)' to let it match on the pose we send"));
+        door_pick->addItem(QStringLiteral("(by place)"));
+        door_actuation_pick_ = door_pick;
+
+        auto* open_btn  = new QPushButton(QStringLiteral("open"),  strip_window_);
+        auto* close_btn = new QPushButton(QStringLiteral("close"), strip_window_);
+        auto* act_state = new QLabel(QStringLiteral("—"), strip_window_);
+        auto* phi_label = new QLabel(QStringLiteral("φ —"), strip_window_);
+        phi_label->setToolTip(QStringLiteral("leaf opening angle: 0° = flush in the aperture, 90° = fully "
+                                             "open. 'pinned' means it is a MODEL CONSTANT, not something "
+                                             "measured — M0 does not fit phi, so the silhouette always "
+                                             "predicts a shut door."));
+        { QFont f = phi_label->font(); f.setPointSizeF(f.pointSizeF() - 1.0); phi_label->setFont(f); }
+        door_phi_label_ = phi_label;
+        for (auto* b : {open_btn, close_btn})
+        {
+            QFont f = b->font(); f.setPointSizeF(f.pointSizeF() - 1.0); b->setFont(f);
+            b->setFixedHeight(QFontMetrics(f).height() + 8);
+            b->setEnabled(false);
+        }
+        { QFont f = act_state->font(); f.setPointSizeF(f.pointSizeF() - 1.0); act_state->setFont(f); }
+        act_state->setToolTip(QStringLiteral("state of the last door request"));
+        door_act_open_btn_ = open_btn; door_act_close_btn_ = close_btn; door_act_state_ = act_state;
+
+        // ★THE BUTTON AND THE `open` AFFORDANCE SHARE ONE REQUEST PATH (request_door_actuation). They
+        // used to be one path and one lambda because there was only the button; the moment an affordance
+        // could also ask, the frame resolution, the by-place refusal, the registration donation and the
+        // phi anticipation all had to exist exactly once, or the autonomous path would quietly differ
+        // from the one anybody had ever tested.
+        const auto fire = [this](bool open)
+        {
+            const auto target = nearest_door_for_actuation();
+            if (not target.has_value())
+            {
+                if (door_act_state_) door_act_state_->setText(QStringLiteral("no door believed"));
+                return;
+            }
+            rc::DoorInstance* inst = nullptr;
+            for (auto& [id, candidate] : fitter_->instances())
+                if (candidate.node_name == target->name)
+                { inst = &candidate; break; }
+            if (inst == nullptr)
+            {
+                if (door_act_state_) door_act_state_->setText(QStringLiteral("door vanished"));
+                return;
+            }
+            std::string provider_id;
+            if (door_actuation_pick_ and door_actuation_pick_->currentIndex() > 0)
+                provider_id = door_actuation_pick_->currentText().toStdString();
+
+            std::string why;
+            const bool sent = request_door_actuation(*inst, open, provider_id,
+                                                      open ? "robot needs to pass through"
+                                                           : "robot has passed through", why);
+            if (door_act_state_)
+                door_act_state_->setText(sent and door_pending_.has_value()
+                    ? QString::fromStdString(inst->node_name + ": " + door_pending_->state)
+                    : QString::fromStdString(why.empty() ? "no provider" : why));
+        };
+        QObject::connect(open_btn,  &QPushButton::clicked, strip_window_, [fire]{ fire(true);  });
+        QObject::connect(close_btn, &QPushButton::clicked, strip_window_, [fire]{ fire(false); });
+
+        bar->addWidget(door_pick, 0);
+        bar->addWidget(open_btn, 0);
+        bar->addWidget(close_btn, 0);
+        bar->addWidget(phi_label, 0);
+        bar->addWidget(act_state, 0);
+        strip_layout->addLayout(bar, 0);
+    }
+
+    restore_strip_geometry();
+    strip_window_->show();
+}
+
+// ─── Door actuation ──────────────────────────────────────────────────────────
+//
+// Which door a button press means. NEAREST TO THE ROBOT, and its name is put on the button, because
+// "the door" is ambiguous the moment two are alive and a silent pick can open one across the flat.
+std::optional<SpecificWorker::ActuationTarget> SpecificWorker::nearest_door_for_actuation() const
+{
+    if (not fitter_ or not inner_eigen_)
+        return std::nullopt;
+    const auto rtb = inner_eigen_->get_transformation_matrix("room", "body", 0);
+    if (not rtb.has_value())
+        return std::nullopt;
+    const Eigen::Vector2f robot(static_cast<float>(rtb.value()(0, 3)),
+                                static_cast<float>(rtb.value()(1, 3)));
+    std::optional<ActuationTarget> best;
+    for (const auto& [id, inst] : fitter_->instances())
+    {
+        if (inst.is_bearing_hypothesis)
+            continue;   // a proto-object is a place to go and look, not a door to ask about
+        const auto& st = inst.model.state();
+        ActuationTarget t;
+        t.name    = inst.node_name;
+        t.xy      = Eigen::Vector2f(st.cx, st.cy);
+        t.yaw     = st.yaw;
+        t.width_m = st.w;
+        t.range_m = (t.xy - robot).norm();
+        // ★THE LEAF ANGLE, and whether it is a MEASUREMENT. In M0 phi is PINNED at 0 — it is not fitted
+        // from anything, so a UI reading "0.0°" would be an assertion the robot has never checked. That
+        // pin is also why a door that really opens reads as absent: the silhouette keeps predicting a
+        // flush leaf. Showing the state and its provenance together is the difference between "the door
+        // is shut" and "we have assumed the door is shut".
+        t.phi = st.phi;                 // DoorState::phi — the belief's leaf angle (LeafPose has no phi)
+        t.phi_fitted = true;    // M1: estimated per cycle from silhouette support (DoorFitter::estimate_phi)
+        if (not best.has_value() or t.range_m < best->range_m)
+            best = std::move(t);
+    }
+    return best;
+}
+
+// Keep the buttons honest: enabled only when the provider says it can actually move a door, labelled
+// with the door they would act on, and carrying the provider's own reason in the tooltip when they are
+// not. Also polls any outstanding request. Called from compute(), cheap.
+void SpecificWorker::refresh_door_actuation_ui()
+{
+    if (not door_act_open_btn_)
+        return;
+    // Capabilities are re-read occasionally, not per cycle: it is a remote call, and a provider that
+    // comes up later must still be picked up without restarting this agent.
+    static int tick = 0;
+    if (++tick % 120 == 0 or door_actuator_.caps().note == "not connected yet")
+        door_actuator_.refresh_caps();
+    const auto& c = door_actuator_.caps();
+
+    // Keep the picker in step with what the provider advertises, without disturbing a live selection.
+    if (door_actuation_pick_ and door_actuation_pick_->count() != static_cast<int>(c.doors.size()) + 1)
+    {
+        const QString keep = door_actuation_pick_->currentText();
+        door_actuation_pick_->clear();
+        door_actuation_pick_->addItem(QStringLiteral("(by place)"));
+        for (const auto& d : c.doors)
+            door_actuation_pick_->addItem(QString::fromStdString(d.id),
+                                          QPointF(d.xy_mm.x(), d.xy_mm.y()));
+        const int back = door_actuation_pick_->findText(keep);
+        door_actuation_pick_->setCurrentIndex(back >= 0 ? back : 0);
+    }
+
+    const auto target = nearest_door_for_actuation();
+    const bool on = c.available and target.has_value();
+    door_act_open_btn_->setEnabled(on);
+    door_act_close_btn_->setEnabled(on);
+    if (door_phi_label_)
+        door_phi_label_->setText(target.has_value()
+            ? QString::fromStdString(std::format("φ {:.1f}° {}", target->phi * 180.0f / static_cast<float>(M_PI),
+                                                 target->phi_fitted ? "(fitted)" : "(pinned)"))
+            : QStringLiteral("φ —"));
+
+    const QString who = target.has_value()
+        ? QString::fromStdString(std::format("{} ({:.1f} m)", target->name, target->range_m))
+        : QStringLiteral("no door believed");
+    const QString tip = QString::fromStdString(c.note) + "\n" + who;
+    door_act_open_btn_->setToolTip(QStringLiteral("ask a provider to OPEN — ") + tip);
+    door_act_close_btn_->setToolTip(QStringLiteral("ask a provider to CLOSE — ") + tip);
+    door_act_open_btn_->setText(target.has_value()
+        ? QString::fromStdString("open " + target->name) : QStringLiteral("open"));
+    door_act_close_btn_->setText(target.has_value()
+        ? QString::fromStdString("close " + target->name) : QStringLiteral("close"));
+
+    if (door_pending_.has_value() and not door_pending_->settled)
+    {
+        door_actuator_.poll(*door_pending_);
+        if (door_act_state_)
+            door_act_state_->setText(QString::fromStdString(door_pending_->door_name + ": "
+                                                            + door_pending_->state));
+    }
+    else if (door_act_state_ and not door_pending_.has_value())
+        door_act_state_->setText(QString::fromStdString(c.available ? "ready" : c.note));
+}
+
+// ─── Belief inspector ────────────────────────────────────────────────────────
+
+// Build the per-instance BELIEF snapshot (pose state, Σ, the 4-mode yaw posterior, scalar gauges) and push
+// it to the bottom panel, throttled to ~5 Hz (a full card rebuild every compute cycle would waste the GUI
+// thread). The door has no EvidenceMonitor to share a tick with, so the gate lives here. Main-thread.
+// Section 1: push this cycle's evidence-pipeline counters, then (same tick, same data) the belief
+// inspector — so the two sections can never show different cycles. Throttled to ~5 Hz.
+void SpecificWorker::refresh_evidence_monitor()
+{
+    if (not evidence_monitor_)
+        return;
+    const auto tick = std::chrono::steady_clock::now();
+    if (last_monitor_tp_.time_since_epoch().count() != 0
+        and std::chrono::duration<float>(tick - last_monitor_tp_).count() < 0.2f)
+        return;
+    last_monitor_tp_ = tick;
+
+    evidence_monitor_->update_view(ev_g_);
+    refresh_belief_inspector();
+    refresh_belief_strip();   // same tick, same instance pass — the views can never disagree
+}
+
+void SpecificWorker::refresh_belief_inspector()
+{
+    if (not belief_inspector_)
+        return;
+    const auto now = std::chrono::steady_clock::now();
+
+    std::vector<rc::BeliefCard> cards;
+    cards.reserve(fitter_->instances().size());
+    for (const auto& [id, inst] : fitter_->instances())
+    {
+        rc::BeliefCard c;
+        c.node = inst.node_name;
+
+        // Σ over the wall-frame [s,w,h]: along-wall offset + panel width + panel height.
+        const auto  S = inst.ai2_belief.covariance_reported();
+        const auto& s = inst.ai2_belief.state();
+        const std::array<float, rc::DoorBelief::N> v = {s.s, s.w, s.h};
+        for (int j = 0; j < rc::DoorBelief::N; ++j)
+            c.dofs.push_back({rc::kDoorDofs[j].name, rc::kDoorDofs[j].unit, v[j],
+                              std::sqrt(std::max(0.0f, S(j, j))), rc::kDoorDofs[j].sigma_star});
+
+        // Row-major copy, filled explicitly: Eigen stores column-major, and while Σ is symmetric today an
+        // implicit .data() copy would silently transpose if that ever stopped being true.
+        constexpr int N = rc::DoorBelief::N;
+        c.cov.resize(N * N);
+        for (int i = 0; i < N; ++i)
+            for (int j = 0; j < N; ++j)
+                c.cov[i * N + j] = S(i, j);
+
+        // ── THE HINGE, AS ITS OWN ROW ────────────────────────────────────────────────────────────
+        // phi is not in Σ — it is the articulated coordinate, minimised in its own branch with the
+        // aperture held — so it gets a DOF row with sigma 0 and no σ*, which is the honest rendering of
+        // "estimated, but we do not yet publish a covariance for it". ⚠That zero is a PLACEHOLDER, not a
+        // claim of certainty; when the hinge branch grows a posterior width this is where it goes.
+        c.dofs.push_back({"phi", "rad", inst.phi_est, 0.0f, -1.0f});
+
+        // ── WHICH CHANNEL CHOSE THE ANGLE, as a footer bar group ─────────────────────────────────
+        // ★THE NUMBER THAT ACTUALLY DIAGNOSES THIS AGENT NOW. The leaf angle is decided by a mixture of
+        // three likelihoods — LiDAR surface (SDF), semantic mask overlap, RGB contour — and which of them
+        // is deciding is invisible from the angle alone. It is exactly what was needed and missing
+        // tonight: a phi of 17.8 deg on a door standing open reads identically whether the SDF found the
+        // leaf and was outvoted, or was silent and the mask walked the estimate back to flush. Those two
+        // want opposite fixes, and one of them (a summed free energy making the SDF curve a delta, so its
+        // weight was either ~0.9 or exactly 0) took a CSV column to see at all.
+        // Drawn as a discrete posterior because that is what it is: the normalised contribution each
+        // channel made to the winning hypothesis. All three at 0 ⇒ nothing measured the angle this cycle.
+        {
+            const float wsum = inst.dbg_w_sdf + inst.dbg_w_mask + inst.dbg_w_edge;
+            if (wsum > 1e-9f)
+            {
+                c.modes.push_back({"phi evidence", "lidar", inst.dbg_w_sdf  / wsum});
+                c.modes.push_back({"phi evidence", "mask",  inst.dbg_w_mask / wsum});
+                c.modes.push_back({"phi evidence", "edge",  inst.dbg_w_edge / wsum});
+            }
+        }
+
+        // No discrete orientation ambiguity: the containing wall fixes the door's yaw.
+
+        // ★`model` is the card's free-text tag; the hinge branch's evidence COUNT goes here because a
+        // free energy computed over zero points is not a small free energy, it is not a measurement —
+        // and the gauge strip has no way to say that on its own.
+        c.model = inst.dbg_leaf_pts > 0
+                ? std::format("hinge: {} lidar pts", inst.dbg_leaf_pts)
+                : std::string("hinge: NO lidar pts");
+        c.s.fe          = inst.dbg_energy;
+        c.s.fe_baseline = inst.fe_baseline;
+        c.s.fe_surprise = inst.fe_surprise;
+        // Un-seeded until the existence channel's first visit; leave the card's NaN so it prints "-" rather
+        // than a fake 0.5 probability.
+        if (inst.existence_seeded)
+        {
+            c.s.logodds  = inst.existence.logodds();
+            c.s.p_exists = inst.existence.p_exists();
+        }
+        c.s.remove_streak = static_cast<int>(inst.existence_debounce.streak);
+        c.s.age_s       = inst.last_belief_touch.time_since_epoch().count() == 0
+                        ? -1.0f
+                        : std::chrono::duration<float>(now - inst.last_belief_touch).count();
+        c.s.since_det   = inst.frames_since_detection;
+        c.s.initialized = inst.ai2_initialized;
+        cards.push_back(std::move(c));
+    }
+    belief_inspector_->update_view(cards);
+}
+
+// ─── Detector truth table (rc::probe) ────────────────────────────────────────────────────────────
+//
+// One row per cycle per live door: WHERE the robot stood, HOW the door projected, and what the
+// detector did. door had no detectability block at all, which is why the question "is this door dying
+// because the detector cannot see it, or because absence is over-charged" had no data behind it.
+//
+// ★WHY THE POSE IS THE POINT. Absence is integrated as if every frame were an independent trial. It is
+// not: measured in retina on 2026-09-08, while the robot is stopped only 5.1% of frames carry a NEW
+// image (99.6% while moving), so a parked robot does not merely repeat a viewpoint — it re-integrates
+// the SAME PIXELS thousands of times. Without (rx,ry,rtheta) that cannot be seen in the file, and any
+// envelope fitted over these rows without de-duplicating by viewpoint will be confident about copies.
+void SpecificWorker::log_detect_probe()
+{
+    if (cfg_.detect_probe_csv_path.empty() or not fitter_ or not mask_ingestor_)
+        return;
+    if (not rc::probe::ensure_open(detect_probe_csv_, cfg_.detect_probe_csv_path))
+        return;
+
+    // Pose is REQUIRED, not optional-with-a-fallback: a row whose viewpoint silently defaulted to the
+    // origin would cluster with every other failed lookup and invent a viewpoint that never existed.
+    if (not inner_eigen_)
+        return;
+    const auto rtb = inner_eigen_->get_transformation_matrix("room", "body", 0);
+    if (not rtb.has_value())
+        return;
+    const auto& Tb = rtb.value();
+    const float rx = static_cast<float>(Tb(0, 3)), ry = static_cast<float>(Tb(1, 3));
+    const float rtheta = static_cast<float>(std::atan2(Tb(1, 0), Tb(0, 0)));
+    float cam_z = static_cast<float>(Tb(2, 3));
+    if (const auto rtz = inner_eigen_->get_transformation_matrix("room", "zed", 0); rtz.has_value())
+        cam_z = static_cast<float>(rtz.value()(2, 3));
+
+    const auto& pkt = mask_ingestor_->packet();
+    int n_all = 0, n_my = 0;
+    if (pkt.valid)
+        for (const auto& sl : pkt.slices)
+        {
+            if (not sl.is_zed()) continue;   // the ZED is the detector this file is about
+            ++n_all;
+            if (sl.label == "door") ++n_my;
+        }
+
+    for (const auto& [id, inst] : fitter_->instances())
+    {
+        const auto& st = inst.model.state();
+        rc::probe::Sample row;
+        row.cycle    = inst.processed_cycles;
+        row.node     = inst.node_name;
+        row.stamp_ms = inst.last_mask_timestamp_ms;
+        row.rx = rx; row.ry = ry; row.rtheta = rtheta; row.cam_z = cam_z;
+        row.ocx = st.cx; row.ocy = st.cy; row.ocz = st.cz;
+        row.range_m       = inst.last_range;
+        row.roi_fill      = inst.roi_fill;
+        row.roi_fill_h    = inst.roi_fill_h;
+        row.roi_fill_v    = inst.roi_fill_v;
+        row.roi_valid     = inst.roi_valid;
+        row.obliquity_cos = inst.dbg_obliquity_cos;
+        row.trunc_frac    = inst.last_trunc_frac;
+        // door's p_detect is the REAL thing — it has a silhouette channel, so this is the number the
+        // removal actually used, not a stand-in.
+        row.p_detect      = inst.dbg_sil_pdetect;
+        row.p_exists_prior = inst.existence.p_exists();
+        // ★THE LABEL IS PER-CYCLE, and it is not detection_alive. That flag LATCHES (measured on hood:
+        // 1 in 9432/9432 rows, still 1 at frames_since_det=6172), so as an outcome it is degenerate and
+        // fit_envelope correctly refuses it. "A mask arrived THIS cycle" is the trial.
+        row.fired = (inst.frames_since_detection == 0);
+        row.conf  = row.fired ? inst.last_mask_confidence : 0.0f;
+        row.n_my = n_my; row.n_all = n_all;
+        // What ELSE the detector called the thing at this place. A door named `wall` is the detector
+        // AGREEING that something is there and misnaming it — the worst case to charge as absence.
+        row.sibling = rc::probe::nearest_other_label(pkt, "door", {st.cx, st.cy});
+        rc::probe::append(detect_probe_csv_, row);
+    }
+}
+
+// ─── Main compute loop ───────────────────────────────────────────────────────
+
+// SHADOW-MODE birth/death recorder — CONCEPT_AGENT_LIFECYCLE.md §4.2, theory in MODEL_HISTORY.md §4.
+// RECORDS ONLY; it can never alter a birth or a removal. NOTE: door has a silhouette channel, so p_detect is the real thing.
+void SpecificWorker::log_phantom_event(std::string_view event, std::uint64_t id, std::string_view name,
+                                       float x, float y, const rc::DoorInstance* inst, std::string_view note)
+{
+    if (not phantom_log_.is_open())
+        return;
+    rc::history::PhantomEvent e;
+    e.event = event; e.id = id; e.name = name; e.x = x; e.y = y; e.note = note;
+    // Observer pose → view bearing: the classifier failure is VIEWPOINT-dependent, so the eventual p_FA field
+    // is keyed on (world cell × bearing), never place alone.
+    // Observer pose → view bearing. SHARED (common/phantom_log/observer_pose.h): the classifier failure is
+    // VIEWPOINT-dependent, so the false-alarm field is keyed on (world cell × bearing), never place alone.
+    rc::history::note_observer(e, inner_eigen_.get(), x, y);
+    if (inst)
+    {
+        e.age_cycles    = inst->processed_cycles;
+        e.p_detect      = inst->dbg_sil_pdetect;
+        e.central_frac  = inst->dbg_sil_central;
+        e.in_fov_frac   = (inst->dbg_sil_ntotal > 0)   // ★a FRACTION: the denominator was
+                        ? static_cast<float>(inst->dbg_sil_ndet) / inst->dbg_sil_ntotal : 0.0f;   // already here, unused
+
+        e.exist_logodds = inst->existence.logodds();
+    }
+    phantom_log_.write(e);
+}
+
+void SpecificWorker::compute()
+{
+    // ★ONE graph walk per cycle for the SHARED mutual-exclusion rule: who else claims room space.
+    // Feeds BOTH the birth filter (a candidate on somebody else's object accrues no evidence) and
+    // the existence occupancy discount. Main thread — collect_graph_obstacles uses ts==0 (CLAUDE.md).
+    if (G) foreign_claims_ = rc::exclusion::foreign_claims(*G, inner_eigen_.get(), "door");
+    if (fitter_) fitter_->set_foreign_claims(&foreign_claims_);   // the FIT judges the same geometry
+
+    if (not G or not rt_api_)
+        return;
+
+    // Which room are we in? Follows ltsm_agent's `current` edge and LETS GO of a room we have left.
+    // Must run before anything below reads room_node_id_ — births, the containment prior and every RT
+    // write are all parented by it.
+    step_room_following();
+    if (room_node_id_ == 0)
+        return;
+
+    // Controller-owned affordance flags (claim / completion / epistemic_pending). Polled here rather than
+    // pushed by update_node_attr_signal — see the connect block in initialize().
+    poll_affordance_protocol();
+
+
+    // Evidence-pipeline per-cycle counters (the *_cum fields persist). Producers below add to these; the
+    // snapshot is pushed at the end of the cycle.
+    ev_g_.births = ev_g_.merges = ev_g_.removals = 0;
+
+    refresh_room_geometry();  // room-containment pose prior (cheap; the polygon is a nominal model)
+    // Low LiDAR sweep in the ROOM frame — the hinge branch's evidence. Main thread (reads the graph).
+    if (lidar_ingestor_ and lidar_ingestor_->pump() and lidar_ingestor_->bpearl_fresh())
+        fitter_->set_leaf_points(lidar_ingestor_->sweep_bpearl_room(),
+                                 lidar_ingestor_->origin_bpearl_room());
+
+    fitter_->update_ego_motion();   // robot/camera speed → "be-still-to-update" gate (once per cycle)
+    mask_ingestor_->refresh();
+    run_instance_tracker();   // data-driven birth/associate/death + merge (the only instance-lifecycle path)
+
+    // Doors are generic `object` nodes named "door_*" (schema migration); filter by name prefix.
+    const auto door_nodes = G->get_nodes_by_type("object");
+    for (const auto& node : door_nodes)
+        if (node.name().starts_with("door"))
+            process_door_node(node);
+
+    // ── The three PRAGMATIC affordances: approach / open / cross ──────────────────────────────────
+    // ★DELIBERATELY OUTSIDE the loop above. process_door_node() bails early on a stale or young
+    // instance, and a cycle that cannot compute a precondition must SAY so rather than be skipped:
+    // rc::pragmatic holds a standing offer on an unmeasured cycle and withdraws it only on a MEASURED
+    // one, which is only possible if it is called on every cycle. Skipping instead would leave the
+    // consumer ranking a price nobody refreshed — the frozen-gain defect the epistemic path already
+    // paid for once (see common/epistemic_step's header).
+    if (cfg_.pragmatic.enabled)
+        for (auto& [door_id, inst] : fitter_->instances())
+            step_pragmatic_affordances(inst);
+
+    // Overall compute()-cycle rate: counts every cycle, prints "Epoch time = …ms. Fps = N" once a
+    // second (FPSCounter::print is throttled and self-counting).
+    // ── Dashboard: counters + belief inspector, one throttled push ──
+    ev_g_.instances  = static_cast<int>(fitter_->instances().size());
+    ev_g_.mask_stale = not mask_ingestor_->packet().valid;
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (last_compute_tp_.time_since_epoch().count() != 0)
+        {
+            const float dt = std::chrono::duration<float>(now - last_compute_tp_).count();
+            if (dt > 1e-4f)
+            {
+                const float hz = 1.0f / dt;
+                ev_g_.compute_hz = ev_g_.compute_hz > 0.0f ? 0.9f * ev_g_.compute_hz + 0.1f * hz : hz;
+            }
+        }
+        last_compute_tp_ = now;
+    }
+    refresh_evidence_monitor();   // throttled inside; no-ops when the dashboard was not built
+
+    fps_counter_.print("[door_concept Compute]");
+}
+
+// Collapse instances whose seat footprints overlap (same physical door fitted twice): keep the one with
+// more integrated fresh evidence, retire the other (affordance + node). Runs before tracking so a
+// duplicate is gone before it is fed a mask. Mirrors table_concept::merge_overlapping_instances.
+// Retire one instance: drop its affordance node, forget it in the fitter, delete its graph node. The single
+// teardown path shared by every lifecycle exit (merge / death), keeping the affordance+fitter+graph invariant.
+// ★Named to match the other four agents, which already had it — this was the same three lines written inline.
+void SpecificWorker::retire_instance(std::uint64_t id)
+{
+    if (auto it = fitter_->instances().find(id); it != fitter_->instances().end())
+    {
+        it->second.affordance.remove();
+        // ★ALL FOUR, or the pragmatic ones leak. Deleting the door node drops its RT edge but NOT its
+        // affordance children, and rc::owned::remove_stale_affordances only runs at startup and shutdown
+        // — so between those an orphaned `aff_door_1_open` would sit in the shared graph, offered, with
+        // nothing alive behind it. Four agents already shipped exactly this (TIER B).
+        it->second.aff_approach.remove();
+        it->second.aff_open.remove();
+        it->second.aff_cross.remove();
+    }
+    fitter_->forget_node(id);
+    G->delete_node(id);
+}
+
+
+void SpecificWorker::merge_overlapping_instances()
+{
+    if (cfg_.tracker_merge_overlap <= 0.0f)
+        return;
+
+    // The sweep is SHARED (common/track); only the two per-object questions stay here.
+    // ★A DOOR'S FOOTPRINT IS ITS APERTURE, NOT ITS LEAF — see footprint_of above: two doors are the same
+    // door when their apertures coincide, and a swung leaf moves while the aperture does not.
+    // ★The counter comes from the sweep now. It USED TO BE ABSENT HERE: door merged instances and never
+    // touched ev_g_.merges, so the dashboard's `merges=%d/%ld` read 0/0 for the life of the agent while
+    // merges were being printed to stdout beside it. bottle and chair had the same hole.
+    rc::track::merge_overlapping(
+        fitter_->instances(), ev_g_,
+        [&](const auto& a, const auto& b) -> std::optional<float>
+        {
+            const float ratio = footprint_overlap_ratio(a.model.state(), b.model.state());
+            return ratio >= cfg_.tracker_merge_overlap ? std::optional{ratio} : std::nullopt;
+        },
+        [](const auto& in) { return in.matched_frames; },      // keep the more-observed instance
+        [&](std::uint64_t keep, std::uint64_t drop, auto&, const auto& dropped, float ratio)
+        {
+            std::print("door_concept: [tracker] MERGE id={} into id={} (footprint overlap {:.2f})\n",
+                       drop, keep, ratio);
+            log_tracker_event("MERGE", drop, dropped.model.state().cx, dropped.model.state().cy,
+                              std::format("into {} overlap {:.2f}", keep, ratio));
+            retire_instance(drop);
+        });
+}
+
+// Data-driven multi-instance lifecycle (mirrors table_concept). Doors are persistent furniture, so
+// death is OFF by default (removed only by MERGE); birth_min_sep is wide. The only instance-lifecycle path.
+void SpecificWorker::run_instance_tracker()
+{
+    merge_overlapping_instances();   // enforce physical exclusion before associating/birthing this cycle
+
+    rc::TrackerParams tp;
+    tp.gate_mahalanobis = cfg_.tracker_gate_mahalanobis;
+    tp.gate_fallback_m  = cfg_.tracker_gate_fallback_m;
+    tp.detection_noise_m = cfg_.tracker_detection_noise_m;
+    tp.birth_frames     = cfg_.tracker_birth_frames;
+    // ★Invariant 5: removal is a Bayesian decision on the existence log-odds, NEVER a miss counter. An
+    //    armed death counter beside a live existence channel is a SECOND removal authority, and it is the
+    //    one that carries no evidence and leaves no attributable record — a phantom analysis cannot tell a
+    //    reasoned removal from a timeout. Tying it to the existence flag makes the two mutually exclusive
+    //    by construction, and keeps them A/B-able: turn the channel off and the counter comes back exactly.
+    //    door removes on `existence.should_remove(exist_removal_prob)` (Existence.Enabled, default true).
+    tp.death_frames     = std::numeric_limits<int>::max();   // never retire by occlusion:
+                                                            // removal is the existence channel's
+    tp.birth_min_sep_m  = cfg_.tracker_birth_min_sep_m;
+    tp.nll_cost         = cfg_.tracker_nll_cost;
+    tracker_.set_params(tp);
+
+    // Tracks ← live instances: centre from the fit, XY cov from the belief's position covariance Σ.
+    std::vector<rc::TrackView> tracks;
+    tracks.reserve(fitter_->instances().size());
+    for (auto& [id, inst] : fitter_->instances())
+    {
+        rc::TrackView t;
+        t.id = id;
+        const auto& s = inst.model.state();
+        t.xy = {s.cx, s.cy};
+        // Is this instance EXPECTED to be seen this cycle — its model projects into the camera FoV.
+        // Read by the tracker's association bookkeeping; out-of-view is a HOLD, never negative evidence.
+        // (It used to feed the miss-counter death path too; that path is gone — removal is the
+        // existence channel's, which weights absence by p_detect rather than by a frame count.)
+        // roi_valid is a cycle stale (set in run_inference) but that is fine for a frustum test.
+        t.expected_visible = inst.roi_valid;
+        if (inst.ai2_initialized)
+        {
+            // Gate association on the belief's position cov (+ chain) → Mahalanobis S = P + R²I.
+            const auto& S = inst.ai2_belief.covariance();
+            t.cov = Eigen::Matrix2f::Zero();
+            t.cov(0, 0) = S(0, 0) + inst.chain_cov_xx;
+            t.cov(1, 1) = S(1, 1) + inst.chain_cov_yy;
+            t.has_cov = true;
+        }
+        tracks.push_back(t);
+        inst.assigned_mask_idx = -1;   // cleared; re-set below only if associated this cycle
+    }
+
+    // Detections ← this frame's "door" mask slices (carry the slice index for the assignment).
+    std::vector<rc::DetectionView> dets;
+    const auto& pkt = mask_ingestor_->packet();
+
+    // ★BIRTH EVIDENCE — the shared CREATE policy (common/instance_tracker/birth_evidence.h). This agent fed
+    // the tracker `birth_evidence = 1.0` on EVERY compute cycle, so `birth_frames` counted cycles rather than
+    // observations: at ~10 Hz compute against a ~9.5 Hz mask stream one mask frame was counted several times,
+    // and "N frames" became well under a second of a single unchanging view — which is how a YOLO false
+    // positive on a wall panel becomes furniture. Three rules, none of them a threshold: an OBSERVATION not a
+    // cycle; birth admitted by the UPDATE rule (frame_admissible — a frame the fit would refuse may not create
+    // an object); and an admissible observation still worth only its reliability (confidence x range).
+    // ★A BACKWARD JUMP MEANS THE PRODUCER RESTARTED, NOT THAT THE FRAME IS STALE. mask_frame_id is a
+    // PER-PROCESS publish counter: when retina restarts it resets to ~0 while this agent still holds the
+    // pre-restart high-water mark, so a plain `>` is false on every subsequent frame — birth_evidence
+    // becomes 0 for ever and NO DOOR CAN EVER BE BORN AGAIN in this process. Silently: the candidate
+    // simply never matures, so none of the three birth-suppression logs fire and the detections keep
+    // arriving normally. Observed live 2026-09-09: retina restarted 11:37:41, a door sat in plain view at
+    // 4.97 m with conf 0.67 and 3094 support points, and door_concept produced no birth for minutes with
+    // nothing in any log to say why. MaskIngestor::refresh already adopts the new stream on exactly this
+    // condition (see its "producer restarted; adopting new stream" note) — this counter is a second,
+    // private copy of the same state that was never given the same rule.
+    const long pkt_frame = pkt.valid ? static_cast<long>(pkt.frame_id) : 0;
+    const bool producer_restarted = pkt.valid and pkt_frame < last_birth_mask_frame_;
+    if (producer_restarted)
+        std::print("door_concept: [birth] mask_frame_id {} < last-seen {} — producer restarted; "
+                   "adopting the new stream\n", pkt_frame, last_birth_mask_frame_);
+    const bool birth_new_obs = pkt.valid and (pkt_frame > last_birth_mask_frame_ or producer_restarted);
+    if (birth_new_obs)
+        last_birth_mask_frame_ = pkt_frame;
+    const rc::birth::Detectability birth_detect{cfg_.ai2_periph_ref, 2.5f, 2.0f};
+
+    if (pkt.valid)
+        for (int i = 0; i < static_cast<int>(pkt.slices.size()); ++i)
+        {
+            const auto& sl = pkt.slices[i];
+                // ★★ONLY THE FRONT RGB-D CAMERA MAY CREATE OR UPDATE AN OBJECT. `has_depth` is NOT that
+                // question: once the producer began depth-filling ricoh masks from reprojected LiDAR it
+                // publishes them as full 3D slices with has_depth = 1, so a 360° detection from BEHIND the
+                // robot passed every guard written as `if (has_depth)`. Reported live on bottle_concept —
+                // moving and cloning with the robot facing away, 3 m off. mask_source says which camera,
+                // unambiguously, and the retina has been publishing it all along. A ricoh slice may
+                // still CONFIRM a live instance (common/peripheral_channel) or raise a proto-object to go and look
+                // at; it may not move one. See MaskIngestor::MaskSlice::may_fit_geometry.
+            if (sl.label != "door" or sl.support_end <= sl.support_begin
+                or not sl.may_fit_geometry()) continue;
+
+            // ★A `door` LABEL IS NOT A DOOR-SIZED THING. YOLO-sem sometimes returns a positive door mask
+            // delimiting a much smaller region — a jamb, a panel edge, a fragment of the leaf. It is a
+            // TRUE positive for the class and a false one for the object, and accepting it is worse than
+            // dropping it: assigned to a live door it covers a fraction of the predicted silhouette, so
+            // occ comes out small and free large, and the door is REMOVED on the strength of having been
+            // detected. Observed live 2026-09-09.
+            //
+            // The prior is already here and already strong — DoorModel prior_h 2.00 +-0.08 m — it was
+            // just never used as a test on the observation, only inside the fit.
+            //
+            // ★ONLY THE "TOO SMALL" DIRECTION, and only on an UNTRUNCATED view. A mask clipped by the
+            // image border, or partly occluded, has a height that is a LOWER BOUND, so judging it would
+            // reject the real door exactly when the robot is close enough for it to overflow the frame.
+            // Nothing is rejected for being too LARGE either: that is a merge/clutter question, not a
+            // size one, and the fit already handles it.
+            // ⚠MEASURED, NOT APPLIED. Two attempts at a size prior on the MASK have now been backed out:
+            //   1. `if (h < prior_h - 3*sigma) continue;` — a magic cutoff, against the modelling rule.
+            //   2. the same thing as a Gaussian in the state prior's own sigma — which merely HID the
+            //      cutoff: at sigma 0.08 m a 1.80 m mask scores 0.044 and a 1.60 m mask 0.000, so any
+            //      real door slightly clipped at the floor datum or partly occluded stopped being born
+            //      at all. Observed immediately: births blocked.
+            // The error was using the prior's uncertainty about the DOOR'S TRUE HEIGHT as the noise model
+            // for a MASK'S MEASURED height. They are different quantities: a mask height is noisy and
+            // systematically UNDER-estimates (partial segmentation, occlusion, the floor datum), so its
+            // likelihood is wide and skewed, and I have not measured it.
+            // So: log mask_h, decide the observation model from the distribution, apply nothing until
+            // then. The reported failure — a small positive mask ending up REMOVING the door — also has
+            // no established mechanism yet; a size prior may not even be the right instrument for it.
+            // ★A LIKELIHOOD, NOT A CUTOFF. The first version of this was `if (h < prior_h - 3*sigma)
+            // continue;` — a magic threshold built out of a prior that is already a distribution, which
+            // is precisely the shape this project's modelling rule says not to add. The prior IS the
+            // model; the observation's weight should fall out of it continuously.
+            //
+            // One-sided on purpose: a mask TALLER than the prior is not penalised (that is a merge or
+            // clutter question the fit already owns), and a TRUNCATED mask is not penalised at all,
+            // because a clipped or occluded height is a LOWER BOUND — judging it would discount the real
+            // door exactly when the robot is close enough for it to overflow the frame. So the weight
+            // only expresses "this is too short to be a whole door, seen whole".
+            //
+            // Nothing is rejected. A 0.7 m fragment simply carries a small fraction of an observation's
+            // worth, in the same units as every other factor in birth_evidence (confidence x range x
+            // unclaimed), and a full-height mask carries all of it.
+            float size_w = 1.0f;
+            {
+                const float untrunc = 1.0f - std::clamp(sl.trunc_frac, 0.0f, 1.0f);
+                const float mask_h  = sl.bbox_max.z() - sl.bbox_min.z();
+                if (sl.has_depth and sl.bbox_max.allFinite() and sl.bbox_min.allFinite()
+                    and untrunc > 0.5f and mask_h > 0.0f and mask_h < cfg_.door_prior_h_m)
+                {
+                    const float z = (cfg_.door_prior_h_m - mask_h) / std::max(1e-3f, cfg_.door_prior_h_std);
+                    size_w = std::exp(-0.5f * z * z);
+                }
+            }
+            rc::DetectionView dv;
+            dv.xy = Eigen::Vector2f(sl.centroid.x(), sl.centroid.y());
+            dv.slice_index = i;
+            // ZED-only BIRTH: only a ZED slice (per-pixel depth ⇒ depth_var==0) may SPAWN a door. A ricoh
+            // LiDAR-reprojected-depth slice (depth_var>0) has unreliable depth/extent, so it may ASSOCIATE to /
+            // confirm an existing door but must NOT birth a phantom — this is exactly what created door_3 (a
+            // wrong ricoh detection at 8.8 m, outside the room). A confident-ricoh escape hatch is OFF by default.
+            const bool is_zed = sl.depth_var == 0.0f;
+            dv.birthable = is_zed or (cfg_.ricoh_birth_enabled
+                                      and sl.confidence >= cfg_.ricoh_birth_conf
+                                      and sl.depth_var  <= cfg_.ricoh_birth_max_var);
+            // One admissible, reliable observation — never a cycle. See birth_evidence.h.
+            dv.birth_evidence = rc::birth::evidence({sl.confidence, sl.range}, birth_detect,
+                                                    birth_new_obs, fitter_->frame_admissible(sl));
+            // ⚠size_w deliberately NOT multiplied in — see the note above. Carried only to be logged.
+            dv.dbg_size_w = size_w;
+
+            // ★MUTUAL EXCLUSION — no two objects occupy the same space (SHARED, common/exclusion).
+            // A continuous support multiplied into the birth evidence exactly like the others above, so a
+            // candidate condensing onto ANOTHER CONCEPT's object never accrues enough to mature: it is not
+            // vetoed, it is unsupported. Every agent already refused to fit two of its OWN instances to one
+            // object; none ever asked what a different concept had claimed, which is how a refrigerator was
+            // created on top of door_3 (16 cm apart, same width, same yaw) and then could not die.
+            if (not foreign_claims_.empty())
+            {
+                const rc::exclusion::Claim* who = nullptr;
+                // A door leaf runs floor to lintel: band [0, prior height]. It is the tallest thing any of
+                // these concepts publishes, so in practice it overlaps everything its footprint touches —
+                // which is the honest answer, and the reason door_3 correctly claimed the phantom fridge.
+                const float unclaimed = rc::exclusion::p_unclaimed(
+                    {dv.xy.x(), dv.xy.y(), cfg_.door_prior_w_m, 0.10f /*leaf thickness*/, 0.0f}, foreign_claims_, &who,
+                    0.0f, cfg_.door_prior_h_m);
+                dv.birth_evidence *= unclaimed;
+                if (unclaimed < 0.99f)
+                    std::print("[door] birth cand CLAIMED by '{}' ({:.0f}%): birth_ev x{:.2f}\n",
+                               who ? who->node : "?", 100.0f * (1.0f - unclaimed), unclaimed);
+            }
+            dets.push_back(dv);
+        }
+
+    // DIAGNOSTIC (merged-vs-single mask): one CSV row per "door" slice per cycle — count, size, centroid,
+    // range. If a cluttered scene collapses to ONE big slice (npts ≫ a clean single door) the extra doors
+    // never get born because no separate detection ever arrives — the failure is upstream, not in birth. File
+    // truncated once per process launch.
+    {
+        static std::ofstream dcsv = []
+        {
+            std::ofstream f; rc::diag::open_rotating(f, "etc/door_dets_log.csv");
+            f << "cycle,n_door_slices,slice_idx,npts,conf,cx,cy,range,trunc_frac,motion_var,"
+                 // mask_h: slice height SPAN (m). size_w: candidate weight, UNAPPLIED.
+                 // ★mask_z0 / mask_z1: the ABSOLUTE height band, which the span alone cannot give. It
+                 // decides what a split door means: pieces at 0.0-0.92 and 0.9-2.2 TILE one panel and
+                 // should be merged for association; two pieces both starting at 0.0 are competing
+                 // claims about the same lower half, which would mean the segmenter can only ever see
+                 // the bottom — and then downgrading them is right rather than merging them.
+                 "mask_h,size_w,mask_z0,mask_z1\n";
+            return f;
+        }();
+        static int dcyc = 0;
+        ++dcyc;
+        if (dcsv)
+        {
+            if (dets.empty())
+                dcsv << dcyc << ",0,-1,0,0,0,0,0,0,0\n";
+            for (const auto& d : dets)
+            {
+                const auto& sl = pkt.slices[d.slice_index];
+                const std::size_t n = (sl.support_end > sl.support_begin) ? (sl.support_end - sl.support_begin) : 0;
+                dcsv << dcyc << ',' << dets.size() << ',' << d.slice_index << ',' << n << ',' << sl.confidence
+                     << ',' << sl.centroid.x() << ',' << sl.centroid.y() << ',' << sl.range << ','
+                     << sl.trunc_frac << ',' << sl.motion_var << ','
+                     << (sl.bbox_max.z() - sl.bbox_min.z()) << ',' << d.dbg_size_w << ','
+                     << sl.bbox_min.z() << ',' << sl.bbox_max.z() << '\n';
+            }
+            dcsv.flush();
+        }
+    }
+
+    const auto res = tracker_.update(tracks, dets);
+
+    static int dbg = 0;
+    const int n_assigned = static_cast<int>(std::count_if(res.assignment.begin(), res.assignment.end(),
+                                                          [](int a){ return a >= 0; }));
+
+    // Evidence-pipeline counters (section 1 of the dashboard). Same fields every concept agent fills.
+    ev_g_.mask_frame_id = pkt.valid ? pkt.frame_id : -1;
+    ev_g_.total_slices  = pkt.valid ? static_cast<int>(pkt.slices.size()) : 0;
+    ev_g_.class_dets    = static_cast<int>(dets.size());
+    ev_g_.assigned      = n_assigned;
+    ev_g_.discarded     = static_cast<int>(dets.size()) - n_assigned;
+    ev_g_.births       += static_cast<int>(res.births.size());
+    ev_g_.births_cum   += static_cast<long>(res.births.size());
+    ev_g_.removals     += static_cast<int>(res.deaths.size());
+    ev_g_.removals_cum += static_cast<long>(res.deaths.size());
+    if (++dbg % 30 == 0 or not res.births.empty() or not res.deaths.empty())
+        std::print("[tracker] instances={} door_dets={} assigned={} unassigned={} births={} deaths={}\n",
+                   tracks.size(), dets.size(), n_assigned,
+                   static_cast<int>(dets.size()) - n_assigned, res.births.size(), res.deaths.size());
+
+    // ASSOCIATE: route each detection's mask slice to its instance (read in observe()).
+    {
+        // §3.1 (Fable, PERCEPTION_ASSOCIATION_PLAN.md): associate by MODEL EVIDENCE, not centroid. The
+        // teleport was: a merged mask's centroid lands MIDWAY between two doors → falls in the wrong
+        // track's Mahalanobis gate → greedy flip. Instead score each (initialised instance × door slice)
+        // by the instance's belief NLL on the slice's POINTS — a merged mask fits NO single-door model, and
+        // each instance keeps the slice that best matches ITS geometry. Greedy lowest-nll, 1-to-1, no gate.
+        // ★The evidence is `association_nll` = the mixture NLL, NOT `mean_energy`: mean_energy weights the SDF
+        // by responsibility, so a FAR slice (all points → clutter) scored ~0 = a PERFECT match → a distant
+        // instance mis-claimed the 3rd door's slice and SUPPRESSED its birth (door "never seen"). The
+        // mixture NLL counts the clutter cost, so a far/clutter'd slice scores HIGH → unclaimed → it births.
+        struct EvPair { float e; std::uint64_t id; int slice; };
+        std::vector<EvPair> pairs;
+        const float R = cfg_.ai2_sigma_base_m * cfg_.ai2_sigma_base_m;
+        const float rn2 = cfg_.tracker_detection_noise_m * cfg_.tracker_detection_noise_m;
+        for (auto& [id, inst] : fitter_->instances())
+        {
+            if (not inst.ai2_initialized) continue;
+            const Eigen::Vector2f bc = inst.ai2_belief.center_xy();   // room-frame panel centre
+            const auto& BS = inst.ai2_belief.covariance();
+            // Σ(0,0)=σ_s² is the along-wall position variance; use it isotropically for the position gate.
+            const float pos_var = BS(0, 0);
+            const float sxx = pos_var + inst.chain_cov_xx + rn2;   // innovation cov diag S = P + R²I
+            const float syy = pos_var + inst.chain_cov_yy + rn2;
+            for (const auto& d : dets)
+            {
+                // POSITION GATE (mirrors the tracker's S=P+R²I Mahalanobis): an instance may claim a slice
+                // ONLY if the slice centroid is within its gate. Without it the evidence greedy assigns EVERY
+                // instance some slice, so an instance whose own door is occluded this frame claims a FAR
+                // door's slice (high nll, but the least-bad available) → suppresses THAT door's birth AND
+                // teleports the instance (the "3rd door never seen" + wrong-pose bug). Gate by position,
+                // rank by shape-evidence = the correct combination.
+                const float ex = d.xy.x() - bc.x(), ey = d.xy.y() - bc.y();
+                const float m2 = ex * ex / std::max(1e-9f, sxx) + ey * ey / std::max(1e-9f, syy);
+                if (m2 > cfg_.tracker_gate_mahalanobis) continue;   // outside the gate → not claimable
+                const auto& sl = pkt.slices[d.slice_index];
+                const std::size_t b = std::min<std::size_t>(sl.support_begin, pkt.support_points.size());
+                const std::size_t e = std::min<std::size_t>(sl.support_end,   pkt.support_points.size());
+                if (e <= b) continue;
+                const std::vector<Eigen::Vector3f> pts(pkt.support_points.begin() + b, pkt.support_points.begin() + e);
+                pairs.push_back({inst.ai2_belief.association_nll(pts, R), id, d.slice_index});
+            }
+        }
+        std::sort(pairs.begin(), pairs.end(), [](const EvPair& a, const EvPair& b) { return a.e < b.e; });
+        std::unordered_set<std::uint64_t> used_inst; std::unordered_set<int> used_slice;
+        for (const auto& p : pairs)
+        {
+            if (used_inst.count(p.id) or used_slice.count(p.slice)) continue;
+            fitter_->instances().at(p.id).assigned_mask_idx = p.slice;
+            used_inst.insert(p.id); used_slice.insert(p.slice);
+        }
+
+        // Pass 2 — INITIALISATION: a freshly-born instance has no belief yet (Pass 1 skips it), so it has no
+        // way to earn its first mask. Assign it the nearest UNUSED slice within the metric fallback gate of
+        // its BIRTH position, so it initialises AT the door it was born from — NOT the nearest door (that
+        // was the teleport: a far-born instance grabbed a near door's mask when its own was occluded, then
+        // merged, so the far door never persisted). If no slice sits at its birth spot this frame it stays
+        // unassigned (frozen) — no teleport.
+        const float fb2 = cfg_.tracker_gate_fallback_m * cfg_.tracker_gate_fallback_m;
+        for (auto& [id, inst] : fitter_->instances())
+        {
+            if (inst.ai2_initialized or used_inst.count(id)) continue;
+            const auto& ms = inst.model.state();
+            int best = -1; float best_r2 = fb2;
+            for (const auto& d : dets)
+            {
+                if (used_slice.count(d.slice_index)) continue;
+                const float ex = d.xy.x() - ms.cx, ey = d.xy.y() - ms.cy, r2 = ex * ex + ey * ey;
+                if (r2 < best_r2) { best_r2 = r2; best = d.slice_index; }
+            }
+            if (best >= 0) { inst.assigned_mask_idx = best; used_slice.insert(best); used_inst.insert(id); }
+        }
+    }
+
+    // EXISTENCE BELIEF: continuous log-odds removal — the principled replacement for the wall-clock
+    // stillbirth prune below. The prune could not kill a MATURE phantom (processed_cycles≥maturity → "furniture"
+    // immunity, purely age-based) and its binary streak reset on ANY assignment, so a phantom fed a trickle of
+    // clutter (door_3: 8 points at 7.4 m) never reached patience AND aged into permanence. The existence belief
+    // fixes both: it integrates SUPPORT-MASS-WEIGHTED evidence (8 pts where ~130 are expected → strong negative)
+    // once per sensor frame, with no age immunity — a real door stays only by continuing to be explained.
+    // ★NO FALLBACK, deliberately — the five agents that retired their prune have none either.
+    // OFF means NO removal, which is an honest nothing; the alternative was a fallback this
+    // file's own comment documents as broken (see the note above).
+    // ★BEFORE the update, deliberately: the row must carry the belief as it stood BEFORE the outcome
+    // recorded on that same row was integrated. Weighting a trial by the posterior the trial produced
+    // is circular, and the one-cycle offset is also what confused the August audit until the column
+    // was renamed `ex_p_prior`. It also means an instance removed THIS cycle still leaves the row
+    // recording the look that removed it.
+    // Refresh the graded posterior ONCE per cycle, before any door samples it: it is a property of the
+    // frame, not of a door, and re-reading it per instance would let two doors in the same cycle be
+    // judged against different frames.
+    semantic_field_.refresh(G.get(), rc::door_semantic_class_id());
+    // One RGB frame per cycle, deep-copied out of the loaned SHM view by the ingestor.
+    if (rgb_ingestor_)
+        rgb_ingestor_->pump();
+    if (depth_ingestor_)
+        depth_ingestor_->pump();
+    refresh_door_actuation_ui();
+
+    log_detect_probe();
+    if (cfg_.exist_enabled)
+        update_existence_beliefs();
+    // BIRTH: spawn an instance from each promoted (persistently-unexplained) detection, seeding the
+    // fitter with the detection XY so the model starts AT the door (not the 0,0 RT-read default).
+    for (const int d : res.births)
+    {
+        const int slice = dets[d].slice_index;
+        // §3.1: under AI2 the assignment is by belief evidence, not the tracker's centroid — so a slice an
+        // existing instance already claimed by mean_energy must NOT also spawn a phantom (the tracker's
+        // centroid birth and the evidence assignment can disagree). Full birth-validity (P(v=clean) — don't
+        // birth from a merged/contaminated mask at all) is §2, still to come.
+        const Eigen::Vector3f& c = pkt.slices[slice].centroid;
+
+        // Room-containment pose prior at BIRTH: never spawn a door outside the walls (a mislocalized frame while
+        // the robot is lost drops a detection beyond a wall). Zero prior mass outside the room → suppress.
+        if (cfg_.exist_room_prior and fitter_->has_room_polygon()
+            and not fitter_->point_in_room(Eigen::Vector2f(c.x(), c.y()), cfg_.exist_room_margin_m))
+        {
+            std::print("door_concept: [tracker] BIRTH SUPPRESSED slice={} at ({:.2f},{:.2f}) — OUTSIDE room\n",
+                       slice, c.x(), c.y());
+            log_tracker_event("SUPPRESS", 0, c.x(), c.y(), "outside room");
+            continue;
+        }
+
+        // MINIMUM-HEIGHT prior at BIRTH: a door is an aperture a person walks THROUGH, so a blob that
+        // demonstrably tops out below MinHeightM is not one — it is a counter, a radiator, a window sill,
+        // a low cabinet. Zero prior mass ⇒ suppress, exactly like the room-containment prior above.
+        //
+        // Judged on the SUPPORT bbox top, never on the fitted h: the template anchor pins h at 2.0 m
+        // regardless of evidence, so by the time an instance exists it always claims to be door-height.
+        // (Live: the phantom at (−4.22,−2.16) reported h ≡ 2.000 for its whole life.)
+        //
+        // "demonstrably" is doing real work — a mask clipped by the image border has an UNOBSERVED top, so
+        // its bbox top is only a lower bound. The real door is routinely clipped, so suppressing on a
+        // truncated view would refuse to ever birth it. Require the view to be substantially untruncated.
+        if (cfg_.exist_min_height_prior and pkt.slices[slice].has_depth and pkt.slices[slice].bbox_max.allFinite())
+        {
+            const float top    = pkt.slices[slice].bbox_max.z();
+            const float untrunc = 1.0f - std::clamp(pkt.slices[slice].trunc_frac, 0.0f, 1.0f);
+            if (untrunc > 0.5f and top < cfg_.exist_min_height_m)
+            {
+                std::print("door_concept: [tracker] BIRTH SUPPRESSED slice={} at ({:.2f},{:.2f}) — support tops "
+                           "at {:.2f} m < {:.2f} m (untruncated view: it is NOT door-height)\n",
+                           slice, c.x(), c.y(), top, cfg_.exist_min_height_m);
+                log_tracker_event("SUPPRESS", 0, c.x(), c.y(), std::format("top {:.2f}m", top));
+                continue;
+            }
+        }
+        // ★AN OPEN LEAF EXPLAINS ITS OWN DETECTION. Once phi is estimated (M1) the model knows where the
+        // panel physically is — swung out of the doorway, often near-perpendicular to the robot — and a
+        // `door` mask landing there is the SAME door, seen in its new pose. Without this the leaf reads
+        // as an unexplained detection half a width from the aperture, and a second door is born from the
+        // first one obeying an order this agent itself gave. The aperture is tested too: a mask in the
+        // now-empty doorway (the frame, validated by the RGB branch) is likewise already accounted for.
+        //
+        // ★THIS IS EXPLAINING-AWAY, NOT A VETO. It suppresses a BIRTH only where the existing belief
+        // already predicts an object; it never suppresses evidence reaching an instance, and it cannot
+        // hide a genuinely new door that is anywhere else. A phi estimate that is wrong stops explaining
+        // and the birth goes ahead — which is the right failure, and is visible in the log line.
+        {
+            const Eigen::Vector2f cxy(c.x(), c.y());
+            std::uint64_t explainer = 0;
+            const char* by = "";
+            for (const auto& [id, inst] : fitter_->instances())
+            {
+                if (inst.is_bearing_hypothesis) continue;
+                // ★TEST THE SWEPT REGION, NOT THE CURRENT POSE. Testing only the leaf quad at the
+                // CURRENT phi has a chicken-and-egg failure that was observed live: both doors are born
+                // in the same cycle, so when the leaf detection arrives the first instance has not yet
+                // estimated phi, its quad is still in the doorway, and the second door is created
+                // anyway — after which the APERTURE instance is the one that dies and the spurious leaf
+                // instance survives. Backwards.
+                //
+                // A hinged leaf of width w sweeps a disc of radius w about its hinge. Any `door` mask
+                // inside that disc is a POSSIBLE POSE OF THIS DOOR at some angle — that is kinematics,
+                // known from the model, independent of the current estimate and available from the
+                // first cycle. Two distinct doors sharing a hinge within one leaf-width is not a real
+                // configuration, so the cost of the wider test is negligible against what it prevents.
+                // ★HINGE-AGNOSTIC, because M0 does not know the hinge. door_geometry.h pins HingeSide
+                // to Near and leaves the real choice to M2, so a disc centred on the ASSUMED hinge is
+                // centred on the wrong end of the door whenever that pin is wrong — and misses by up to
+                // a full leaf width. Measured 2026-09-09: the spurious instance sat 1.306 m from the
+                // aperture centre while the from-the-hinge radius was 0.865 m, so it was never tested.
+                //
+                // The leaf hinges on ONE of the two vertical edges, each half_w from the aperture
+                // centre, and reaches w from its hinge. So the union of everything it can occupy under
+                // either choice is a disc about the APERTURE CENTRE of radius half_w + w — exact, not a
+                // margin, and it is what the model genuinely knows while the hinge is unresolved.
+                const rc::door::LeafPose& L = inst.leaf_pose;
+                const float leaf_w  = 2.0f * L.half_w;
+                const float swept_r = L.half_w + leaf_w + L.half_t;
+                if ((cxy - inst.aperture.centre_xy()).norm() <= swept_r)
+                { explainer = id; by = "leaf swept arc (hinge unresolved)"; break; }
+                if (point_in_quad(rc::door::footprint(inst.aperture), cxy)) { explainer = id; by = "aperture"; break; }
+            }
+            if (explainer != 0)
+            {
+                const auto it = fitter_->instances().find(explainer);
+                const float phi_deg = (it != fitter_->instances().end())
+                    ? it->second.phi_est * 180.0f / static_cast<float>(M_PI) : 0.0f;
+                std::print("door_concept: [tracker] BIRTH SUPPRESSED slice={} at ({:.2f},{:.2f}) — "
+                           "explained by {}'s {} (phi {:.0f} deg)\n",
+                           slice, c.x(), c.y(),
+                           it != fitter_->instances().end() ? it->second.node_name : std::string{"?"},
+                           by, phi_deg);
+                log_tracker_event("SUPPRESS", explainer, c.x(), c.y(),
+                                  std::format("{} phi {:.0f}deg", by, phi_deg));
+                continue;
+            }
+        }
+
+        {
+            std::uint64_t claimer = 0;
+            for (auto& [id, inst] : fitter_->instances())
+                if (inst.assigned_mask_idx == slice) { claimer = id; break; }
+            if (claimer != 0)
+            {
+                // DIAGNOSTIC (missing-door): a persistently-detected cluster that never instantiates is
+                // usually a birth SUPPRESSED here — a distant instance's belief mis-claimed this slice by
+                // mean_energy, stealing it from birth (and likely teleporting toward it). Surface which
+                // instance claimed it and how far it sits, so the failure is visible, not silent.
+                float dist = -1.0f;
+                if (auto it = fitter_->instances().find(claimer); it != fitter_->instances().end())
+                {
+                    const auto& st = it->second.model.state();
+                    dist = std::hypot(st.cx - c.x(), st.cy - c.y());
+                }
+                std::print("door_concept: [tracker] BIRTH SUPPRESSED slice={} at ({:.2f},{:.2f}) — claimed by "
+                           "id={} ({:.2f} m away)\n", slice, c.x(), c.y(), claimer, dist);
+                log_tracker_event("SUPPRESS", claimer, c.x(), c.y(), std::format("claimer {:.2f}m", dist));
+                continue;
+            }
+        }
+        // RE-ACQUISITION: is this detection a door that was removed and has come back at the same place? If so
+        // it is not a new object — it takes its old name and resumes the belief it had converged to, instead of
+        // becoming door_N+1 with template priors. (Live run: one real door burned three identities this way.)
+        const rc::DoorBelief* revive = nullptr;
+        std::string preferred_name;
+        if (const DoorGhost* g = match_ghost(Eigen::Vector2f(c.x(), c.y())); g != nullptr)
+        {
+            preferred_name = g->name;
+            revive = &g->belief;
+            std::print("door_concept: [tracker] RE-ACQUIRE '{}' at ({:.2f},{:.2f}) — {:.2f} m from where it was "
+                       "removed after {} cycles; resuming its belief\n",
+                       g->name, c.x(), c.y(), (g->xy - Eigen::Vector2f(c.x(), c.y())).norm(), g->lived_cycles);
+        }
+        // No ghost from THIS run, but the place may still be a door we have met before. The persistent table
+        // returns the NAME only: geometry has to be re-earned from evidence (a remembered belief would be
+        // asserting a shape nothing in this session has seen), while the identity is a fact about the
+        // apartment, not about the session. This is what stops door_1/door_2 from trading doors on restart.
+        else if (const DoorIdentity* idn = match_identity(Eigen::Vector2f(c.x(), c.y())); idn != nullptr)
+        {
+            preferred_name = idn->name;
+            std::print("door_concept: [tracker] IDENTITY '{}' at ({:.2f},{:.2f}) — {:.2f} m from the aperture "
+                       "remembered in etc/door_identities.csv; same door, name restored (belief re-earned)\n",
+                       idn->name, c.x(), c.y(), (idn->xy - Eigen::Vector2f(c.x(), c.y())).norm());
+        }
+        const auto reserved = reserved_names();   // a number a ghost or a stored identity holds is not free
+        const auto new_id = scene_graph_->create_instance_from_detection(c, room_node_id_, preferred_name, reserved);
+        if (new_id != 0)
+        {
+            fitter_->note_birth(new_id, Eigen::Vector2f(c.x(), c.y()));
+            // ★SENIORITY IS OBSERVED AT BIRTH, not inferred later (common/exclusion). Birth is the only
+            // moment at which "who was here first" is actually seen: resolving it on a later cycle would
+            // have a real object, standing legitimately beside a real neighbour, wake up after a RESTART,
+            // find the neighbour present, and declare ITSELF the junior. Anything not created this run
+            // stays senior by default — the rule can fail to catch a collision, never invent one.
+            if (auto it = fitter_->instances().find(new_id); it != fitter_->instances().end())
+                it->second.exclusion.resolve_at_birth({c.x(), c.y(), cfg_.door_prior_w_m, 0.10f /*leaf thickness*/, 0.0f},
+                                                      foreign_claims_, 0.0f, cfg_.door_prior_h_m);
+            // Shadow-mode birth record (CONCEPT_AGENT_LIFECYCLE.md §4.2): place + viewpoint that
+            // produced it, so a phantom that dies young is attributable to both.
+            log_phantom_event("BIRTH", new_id, "", c.x(), c.y(), nullptr, "");
+            if (revive != nullptr)
+            {
+                fitter_->note_reacquire(new_id, *revive);
+                log_tracker_event("REACQUIRE", new_id, c.x(), c.y(), preferred_name);
+                forget_ghost(Eigen::Vector2f(c.x(), c.y()));   // consumed — the door is alive again
+            }
+            // Materialise the DoorInstance NOW, at birth — do not wait for the freshly inserted DSR node
+            // to surface in get_nodes_by_type (it is not reliably visible the same cycle). Birth was
+            // decoupled across three async steps (create node → ensure_instance when the node appears →
+            // belief init when a mask associates), so a born instance was never registered as a track:
+            // the tracker kept seeing its detection unexplained and RE-BIRTHED it every cycle (the
+            // 403-birth / 401-merge churn, duplicates collapsing at 0,0). Creating the instance here
+            // registers it as a track immediately and hands it its birth slice so observe()/run_inference
+            // initialise the belief AT the detection centroid this cycle — birth, track, and init are now atomic.
+            if (const auto nopt = G->get_node(new_id); nopt.has_value())
+            {
+                fitter_->ensure_instance(nopt.value(), room_node_id_);
+                if (auto it = fitter_->instances().find(new_id); it != fitter_->instances().end())
+                    it->second.assigned_mask_idx = slice;
+                // Write the identity down NOW, at the birth place. Waiting for removal or shutdown loses it
+                // to a SIGKILL — and the fleet gets SIGKILLed (see the attr-signal starvation note); the
+                // aperture is refined by the later upserts anyway.
+                note_identity(nopt->name(), Eigen::Vector2f(c.x(), c.y()));
+            }
+            log_tracker_event("BIRTH", new_id, c.x(), c.y(), "");
+        }
+    }
+
+    // ── Peripheral (ricoh-360) channel — common/peripheral_channel, the one path for all seven ──────
+    // ★BOTH BEARING-BIRTH BLOCKS REMOVED (2026-08-15). This agent had two: one staging an unmatched
+    // bearing into an instance at a nominal range, and one staging it as a "hypothesis" with Sigma
+    // elongated along the unknown range, authoring an Orient affordance so a later depth mask could
+    // collapse it. The second was better motivated and still a birth from the sensor that cannot
+    // measure range, in two agents out of seven. The proto-object / saccadic path is that idea done
+    // once for everyone WITHOUT creating a graph node first: raise a candidate, go and look, then
+    // birth with a real range. What survives here is confirmation, which is all a peripheral glance
+    // is entitled to.
+    // No enable flag: confirmation is what a peripheral glance is FOR, and the other five agents
+    // never had one. Guarded on having something to confirm against.
+    if (not tracks.empty() and mask_ingestor_)
+    {
+        const auto& pkt_p = mask_ingestor_->packet();
+        Eigen::Vector2f robot_xy(0.f, 0.f);
+        if (const auto rp = inner_eigen_->transform("room", Eigen::Vector3d::Zero(), "zed"); rp.has_value())
+            robot_xy = {static_cast<float>(rp->x()), static_cast<float>(rp->y())};
+
+        const auto dets_p = rc::peripheral::gather(pkt_p, "door", robot_xy);
+        if (not dets_p.empty())
+        {
+            std::vector<rc::peripheral::TrackRef> trefs;
+            trefs.reserve(tracks.size());
+            for (const auto& t : tracks)
+                trefs.push_back({t.id, t.xy, 0.50f});
+            rc::peripheral::Params pp;
+            pp.angular_margin_rad = cfg_.bearing_confirm_gate_rad;
+            for (const auto& c : rc::peripheral::associate(trefs, dets_p, robot_xy, pp).confirms)
+                for (auto& t : tracks)
+                    if (t.id == c.track_id)
+                        t.expected_visible = false;   // hold the death-miss (peripheral glance)
+        }
+    }
+}
+
+// Snapshot residual_concept's published residual field. Mirrors table_concept::read_residual_field — same
+// node, same attribute trio — so this is one more consumer of an established channel. The field is already
+// EXPLAINED-COLLAPSED by the producer (cells a modelled object accounts for are attenuated toward zero), so
+// "first cell above p_occupied along a ray" means "first thing out there nothing explains" with no extra
+// filtering here. Returns false (and leaves the field empty ⇒ invalid ⇒ the cascade skips this rung) whenever
+// residual_concept is not up yet, which is the normal state during startup.
+bool SpecificWorker::read_residual_field()
+{
+    return rc::read_residual_field(*G, room_node_id_, residual_field_);
+}
+
+// Load the room's delimiting polygon (a trusted NOMINAL model authored by room_concept, never fitted) into the
+// fitter so it can impose the room-containment pose prior. Mirrors cabinet_concept::refresh_room_geometry.
+void SpecificWorker::refresh_room_geometry()
+{
+    static int miss = 0;                          // throttle the "polygon still missing" diagnostic
+    if (not G or room_node_id_ == 0) return;
+    auto room = G->get_node(room_node_id_);
+    if (not room.has_value())
+    {
+        // Latched room id went stale (room_concept recreated the room on relocalization). Re-resolve so the
+        // containment prior recovers instead of silently reading a dead node forever.
+        const auto rooms = G->get_nodes_by_type("room");
+        if (rooms.empty()) { room_node_id_ = 0; return; }
+        room_node_id_ = rooms.front().id();
+        room = G->get_node(room_node_id_);
+        if (not room.has_value()) return;
+    }
+    const auto px = G->get_attrib_by_name<delimiting_polygon_x_att>(room.value());
+    const auto py = G->get_attrib_by_name<delimiting_polygon_y_att>(room.value());
+    if (not px.has_value() or not py.has_value())
+    {
+        if (++miss % 120 == 1)
+            std::print("door_concept: [room-prior] room node {} has NO delimiting_polygon attribute yet "
+                       "(containment prior INACTIVE — out-of-room doors cannot be removed)\n", room_node_id_);
+        return;
+    }
+    const auto& xs = px->get(); const auto& ys = py->get();
+    const std::size_t n = std::min(xs.size(), ys.size());
+    if (n < 3)
+    {
+        if (++miss % 120 == 1)
+            std::print("door_concept: [room-prior] delimiting_polygon present but degenerate (n={})\n", n);
+        return;
+    }
+    std::vector<Eigen::Vector2f> poly; poly.reserve(n);
+    Eigen::Vector2f centroid = Eigen::Vector2f::Zero();
+    float xmin = 1e9f, xmax = -1e9f, ymin = 1e9f, ymax = -1e9f;
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        poly.emplace_back(xs[i], ys[i]); centroid += poly.back();
+        xmin = std::min(xmin, xs[i]); xmax = std::max(xmax, xs[i]);
+        ymin = std::min(ymin, ys[i]); ymax = std::max(ymax, ys[i]);
+    }
+    centroid /= static_cast<float>(n);
+    const bool first = not fitter_->has_room_polygon();
+    fitter_->set_room_geometry(centroid, std::move(poly));
+    if (first)
+        std::print("door_concept: [room-prior] room polygon LOADED — {} verts, x∈[{:.2f},{:.2f}] y∈[{:.2f},{:.2f}] "
+                   "(containment prior ACTIVE)\n", n, xmin, xmax, ymin, ymax);
+}
+
+// ─── Identity re-acquisition (ghost registry) ───────────────────────────────────────────────────
+
+// Remember a door about to be deleted, so the same physical door coming back resumes this identity + geometry.
+void SpecificWorker::remember_ghost(const rc::DoorInstance& inst)
+{
+    if (cfg_.exist_reacquire_radius_m <= 0.0f or not inst.ai2_initialized or inst.is_bearing_hypothesis)
+        return;
+    // Keyed on the APERTURE: the identity of a door is its hole in the wall, so a door that flickers out
+    // while its leaf happens to be open must still be re-acquired at the same place.
+    const auto& s = inst.model.state();
+    const Eigen::Vector2f ap(s.ap_cx, s.ap_cy);
+    // A GHOST IS A PLACE, NOT A NAME. Superseding by name was the identity defect: `door_1` died at the north
+    // door, its number was recycled to a different door across the room, and when THAT one died this line
+    // erased the north door's ghost — so the real door, reborn 0.50 m from where it died (well inside
+    // ReacquireRadiusM), had nothing to match and came back as door_3. Only a ghost of the SAME HOLE may be
+    // replaced; that is the one this removal actually supersedes. (Name recycling is now blocked upstream in
+    // create_instance_from_detection, so two ghosts cannot normally share a name either.)
+    std::erase_if(ghosts_, [&](const DoorGhost& g)
+                  { return (g.xy - ap).norm() < cfg_.exist_reacquire_radius_m; });
+    ghosts_.push_back({inst.node_name, ap, inst.ai2_belief, inst.processed_cycles});
+    note_identity(inst.node_name, ap);   // the RAM ghost expires with the process; the identity must not
+    // Bounded, most-recent-first: this is a short-lived flicker memory, not a permanent map.
+    while (static_cast<int>(ghosts_.size()) > std::max(1, cfg_.exist_ghost_max))
+        ghosts_.erase(ghosts_.begin());
+}
+
+// The names still spoken for by a removed-but-remembered door — this run's ghosts AND the identities
+// persisted from earlier runs. Handed to the birth path so a freed number is never given to a DIFFERENT
+// physical door while its owner can still come back and claim it.
+std::vector<std::string> SpecificWorker::reserved_names() const
+{
+    std::vector<std::string> names;
+    names.reserve(ghosts_.size() + identities_.size());
+    for (const auto& g : ghosts_)      names.push_back(g.name);
+    for (const auto& i : identities_)  names.push_back(i.name);
+    return names;
+}
+
+// ─── Identity across runs (etc/door_identities.csv) ─────────────────────────────────────────────
+//
+// Ghosts are RAM: they cannot survive the process, and cleanup_owned_nodes deletes every door node on the
+// way out, so at the next launch nothing in the graph says which door was which. Names then fell out of
+// BIRTH ORDER — the order the robot happens to sweep the room — and the same physical door was door_1 one
+// run and door_2 the next. This table is the persistent half of the same idea as remember_ghost: keyed on
+// the APERTURE (the hole in the wall, which is what a door IS), carrying the name and nothing else.
+//
+// Locale: read with std::from_chars, write through the classic locale — CLAUDE.md. These machines run
+// es_ES, where strtof would silently truncate "4.61" to 4 and put every door on the wrong side of a wall.
+
+void SpecificWorker::load_identities()
+{
+    std::ifstream f("etc/door_identities.csv");
+    if (not f)
+        return;
+    identities_.clear();
+    std::string line;
+    std::getline(f, line);                       // header
+    while (std::getline(f, line))
+    {
+        const auto c1 = line.find(',');
+        if (c1 == std::string::npos) continue;
+        const auto c2 = line.find(',', c1 + 1);
+        if (c2 == std::string::npos) continue;
+        const std::string name = line.substr(0, c1);
+        float x = 0.f, y = 0.f;
+        const char* xb = line.data() + c1 + 1;
+        const char* xe = line.data() + c2;
+        const char* yb = line.data() + c2 + 1;
+        const char* ye = line.data() + line.size();
+        if (std::from_chars(xb, xe, x).ec != std::errc{}) continue;
+        if (std::from_chars(yb, ye, y).ec != std::errc{}) continue;
+        if (not name.starts_with("door_")) continue;
+        identities_.push_back({name, Eigen::Vector2f(x, y)});
+    }
+    if (not identities_.empty())
+    {
+        std::print("door_concept: [identity] loaded {} remembered door(s):", identities_.size());
+        for (const auto& i : identities_)
+            std::print(" {}@({:.2f},{:.2f})", i.name, i.xy.x(), i.xy.y());
+        std::print("\n");
+    }
+}
+
+void SpecificWorker::save_identities() const
+{
+    // DIAG-ROTATE: exempt — this is PERSISTED STATE, not a diagnostics log. note_identity() rewrites the
+    // whole table on every identity change, so rotating here would leave one stamped copy per door seen.
+    std::ofstream f("etc/door_identities.csv", std::ios::trunc);
+    if (not f)
+        return;
+    f.imbue(std::locale::classic());             // never emit a comma decimal separator
+    f << "name,ap_x,ap_y\n";
+    for (const auto& i : identities_)
+        f << i.name << ',' << i.xy.x() << ',' << i.xy.y() << '\n';
+}
+
+// Upsert BY PLACE: one hole in the wall carries one name. A door whose aperture drifts within the
+// re-acquisition radius updates its own row; a door somewhere else adds one.
+void SpecificWorker::note_identity(const std::string& name, const Eigen::Vector2f& ap)
+{
+    if (cfg_.exist_reacquire_radius_m <= 0.0f or not name.starts_with("door_") or not ap.allFinite())
+        return;
+    std::erase_if(identities_, [&](const DoorIdentity& i)
+                  { return i.name == name or (i.xy - ap).norm() < cfg_.exist_reacquire_radius_m; });
+    identities_.push_back({name, ap});
+    save_identities();
+}
+
+const SpecificWorker::DoorIdentity* SpecificWorker::match_identity(const Eigen::Vector2f& xy) const
+{
+    if (cfg_.exist_reacquire_radius_m <= 0.0f)
+        return nullptr;
+    const DoorIdentity* best = nullptr;
+    float best_d = cfg_.exist_reacquire_radius_m;
+    for (const auto& i : identities_)
+        if (const float d = (i.xy - xy).norm(); d < best_d) { best_d = d; best = &i; }
+    return best;
+}
+
+// Shutdown: the doors still alive have never been remembered (remember_ghost only fires on removal), and
+// they are about to be deleted from the graph. Write them down or the next run starts blind.
+void SpecificWorker::remember_live_identities()
+{
+    if (not fitter_)
+        return;
+    for (const auto& [id, inst] : fitter_->instances())
+    {
+        if (not inst.ai2_initialized or inst.is_bearing_hypothesis)
+            continue;
+        const auto& s = inst.model.state();
+        note_identity(inst.node_name, Eigen::Vector2f(s.ap_cx, s.ap_cy));
+    }
+}
+
+const SpecificWorker::DoorGhost* SpecificWorker::match_ghost(const Eigen::Vector2f& xy) const
+{
+    if (cfg_.exist_reacquire_radius_m <= 0.0f)
+        return nullptr;
+    const DoorGhost* best = nullptr;
+    float best_d = cfg_.exist_reacquire_radius_m;
+    for (const auto& g : ghosts_)
+        if (const float d = (g.xy - xy).norm(); d < best_d) { best_d = d; best = &g; }
+    return best;
+}
+
+// ─── NBV decision monitor (etc/door_nbv_log.csv) ────────────────────────────────────────────────
+//
+// "The robot is still being sent into the door" has THREE possible authors — the four-face plan, the pose we
+// publish, or the controller's own standpoint repair downstream — and no artefact could tell them apart. This
+// row is the producer's full confession: where the door is, where we told the robot to stand, how far apart
+// those are, and the per-face evidence behind the choice. If `dist_m` here is healthy (~the stand-off) and the
+// robot still ends up at the leaf, the defect is downstream of this agent and the CSV proves it.
+//
+// One row per PUBLISHED proposal (i.e. per affordance refresh), so it lines up 1:1 with what the controller
+// can see. Written through the classic locale — see CLAUDE.md: these machines run es_ES, and an ofstream that
+// picks up a comma separator would corrupt its own columns on read-back.
+void SpecificWorker::log_nbv_decision(const rc::DoorInstance& inst, const rc::nbv::Plan& plan,
+                                      const rc::EpistemicProposal& prop)
+{
+    static std::ofstream csv = []
+    {
+        std::ofstream f; rc::diag::open_rotating(f, "etc/door_nbv_log.csv");
+        f.imbue(std::locale::classic());
+        f << "cycle,node,valid,door_cx,door_cy,door_yaw,door_w,ap_cx,ap_cy,"
+             "face,standoff_m,band_min_m,band_max_m,tgt_x,tgt_y,tgt_yaw,dist_to_door_m,tgt_in_room,gain,"
+             "vis_px,vis_nx,vis_py,vis_ny,reach_px,reach_nx,reach_py,reach_ny,"
+             "pdet_px,pdet_nx,pdet_py,pdet_ny,exp_px,exp_nx,exp_py,exp_ny,n_obstacles\n";
+        return f;
+    }();
+    if (not csv)
+        return;
+
+    const auto& ms = inst.model.state();
+    // THE number to read first: how far the published standpoint is from the door the robot must photograph.
+    // A value near 0 means we are driving it into the leaf; it should sit inside [band_min, band_max].
+    const float dist = std::hypot(prop.epistemic_target_x_m - ms.cx, prop.epistemic_target_y_m - ms.cy);
+    const bool in_room = fitter_->has_room_polygon()
+                       ? fitter_->point_in_room(Eigen::Vector2f(prop.epistemic_target_x_m,
+                                                                prop.epistemic_target_y_m), 0.0f)
+                       : true;
+    static const char* fn[4] = {"+x", "-x", "+y", "-y"};
+    csv << inst.processed_cycles << ',' << inst.node_name << ',' << (plan.valid ? 1 : 0) << ','
+        << ms.cx << ',' << ms.cy << ',' << ms.yaw << ',' << ms.w << ',' << ms.ap_cx << ',' << ms.ap_cy << ','
+        << (plan.valid ? fn[plan.best_face] : "-") << ',' << plan.best_standoff_m << ','
+        << plan.standoff_min_m << ',' << plan.standoff_max_m << ','
+        << prop.epistemic_target_x_m << ',' << prop.epistemic_target_y_m << ','
+        << prop.epistemic_target_yaw_rad << ',' << dist << ',' << (in_room ? 1 : 0) << ','
+        << prop.epistemic_gain;
+    for (int i = 0; i < 4; ++i) csv << ',' << plan.face_visible[i];
+    for (int i = 0; i < 4; ++i) csv << ',' << (plan.face_reachable[i] ? 1 : 0);
+    for (int i = 0; i < 4; ++i) csv << ',' << plan.face_p_detect[i];
+    for (int i = 0; i < 4; ++i) csv << ',' << plan.face_gains[i];
+    csv << ',' << nbv_obstacle_count_ << '\n';
+    csv.flush();
+
+    // Loud, once, if we ever publish a standpoint ON the door: that is the user-visible "crash into it"
+    // symptom, and it must never pass silently just because a CSV recorded it.
+    if (plan.valid and dist < plan.standoff_min_m * 0.5f)
+    {
+        static int shouted = 0;
+        if (shouted++ < 5)
+            std::print("door_concept: [NBV] ★PUBLISHING A STANDPOINT ON THE DOOR — {} target=({:.2f},{:.2f}) is "
+                       "{:.2f} m from the leaf, band=[{:.2f},{:.2f}] face={} in_room={}\n",
+                       inst.node_name, prop.epistemic_target_x_m, prop.epistemic_target_y_m, dist,
+                       plan.standoff_min_m, plan.standoff_max_m, fn[plan.best_face], in_room ? 1 : 0);
+    }
+}
+
+// Consume the ghost(s) at a place a door has just been re-acquired at. By PLACE, for the same reason
+// remember_ghost supersedes by place: a name can outlive its owner and be worn by a ghost somewhere else
+// entirely, and erasing that one would throw away an identity nobody claimed.
+void SpecificWorker::forget_ghost(const Eigen::Vector2f& xy)
+{
+    std::erase_if(ghosts_, [&](const DoorGhost& g)
+                  { return (g.xy - xy).norm() < cfg_.exist_reacquire_radius_m; });
+}
+
+// Continuous existence belief on the SHARED rc::exist channel (the one table/chair use): fold one sensor
+// frame of pixel-level silhouette evidence into each instance's log-odds L and remove the doors whose
+// predicted silhouette is demonstrably empty. See DoorInstance::existence for the model.
+//
+// The discipline, and what each part of it fixes (live run 2026-07-29, etc/door_existence_log.csv):
+//   OCCUPANCY confirms · ABSENCE removes · OCCLUSION and OUT-OF-FoV **HOLD**.
+//   · HOLD is structural, not a special case: rc::exist HOLDs whenever n_detectable==0, so a door behind the
+//     robot contributes nothing. The old scheme took pd = max(zed_pd, range_detectability) where the second
+//     term had NO bearing test — a door squarely behind the camera scored pd≈0.25–0.47 and was charged
+//     absence every frame until it died (door_1: L 4 → −3.01 over ~180 frames while roi=0), then re-born as
+//     door_3 at the same spot. That whole term is gone.
+//   · Occlusion shrinks the detectable footprint continuously (occluded samples simply do not vote) instead
+//     of the old `continue`, which granted indefinite immunity — door_2 sat frozen at L=2.29 for 1204 frames
+//     because its line of sight happened to be blocked.
+//   · Detectability is now ONE physical covariate, the silhouette's subtended image area (n_cells), which
+//     collapses for a far door AND for an edge-on one. The old separate obliquity ramp returned exactly 0
+//     below cos=0.20, making a grazing phantom permanently unjudgeable.
+// Runs from run_instance_tracker (association already resolved, so assigned_mask_idx is this cycle's).
+void SpecificWorker::update_existence_beliefs()
+{
+    // Integrate at the SENSOR rate, not the compute rate: only when a new mask frame arrived. Otherwise a fast
+    // compute loop would decay a briefly-occluded real door away between two sensor frames.
+    const auto& pkt = mask_ingestor_->packet();
+    const bool sensor_fresh = pkt.valid and static_cast<int>(pkt.frame_id) != exist_last_mask_frame_;
+    if (not sensor_fresh)
+        return;
+    exist_last_mask_frame_ = static_cast<int>(pkt.frame_id);
+
+    // The silhouette channel needs the producer's raw 2D mask pixels (mask_pixels_xy — an OPTIONAL, newer
+    // producer channel). Without them EVERY door reports n_detectable==0 and therefore HOLDs forever, which
+    // looks exactly like "phantoms are never removed". Say so once rather than failing silently.
+    if (pkt.mask_pixels.empty())
+    {
+        static bool warned = false;
+        if (not warned)
+        {
+            warned = true;
+            std::print("door_concept: [existence] WARNING — the masks node carries no mask_pixels_xy; the "
+                       "silhouette channel has no evidence, so NO door can be confirmed or removed. Check the "
+                       "retina's mask-pixel publish.\n");
+        }
+        return;
+    }
+
+    // Physical sensor rates (interpretable detection/clutter probabilities), shared with table/chair.
+    rc::exist::SensorModel sm;
+    sm.sensor_sigma_m = cfg_.exist_sensor_sigma_m;
+    sm.detection_prob = cfg_.exist_detection_prob;
+    sm.clutter_prob   = cfg_.exist_clutter_prob;
+
+    // ★ONE removal policy, the SHARED one (rc::exist::RemovalPolicy / decide_removal). door was the last agent
+    // still hand-writing this decision, in THREE places — and two of them counted CYCLES (`+= 1.0f`), the exact
+    // form the shared module was extracted to eliminate. Hand-written copies is how the debounce drifted three
+    // ways before, and it is why the confidence-scaled `required` fix would otherwise have reached five agents
+    // out of six. The two PRIOR channels below keep their full-weight advance — that is a real, argued
+    // difference (a prior is visibility-independent by construction) and it is expressed by passing a
+    // resolvability of 1.0, not by rewriting the policy.
+    rc::exist::RemovalPolicy policy;
+    policy.logodds_max   = cfg_.exist_max_logodds;
+    policy.removal_prob  = cfg_.exist_removal_prob;
+    policy.remove_frames = static_cast<float>(cfg_.exist_remove_frames);
+
+    std::vector<std::uint64_t> to_remove;
+    for (auto& [id, inst] : fitter_->instances())
+    {
+        inst.existence.set_max(cfg_.exist_max_logodds);
+        if (not inst.existence_seeded)               // seed on first visit (fresh birth OR adopted graph node)
+        {
+            inst.existence.set(cfg_.exist_birth_logodds);
+            inst.existence_seeded = true;
+        }
+
+        // ROOM-CONTAINMENT POSE PRIOR (runs BEFORE the sensor channel, so it reaches a door a localization glitch
+        // put OUTSIDE the walls / behind a wall where the sensor can never vacate it): P(door outside) ≈ 0, so
+        // an out-of-room centre draws a STRONG negative every frame regardless of visibility → removed in a few.
+        // This is a genuine PRIOR over pose, not a detectability heuristic, so it survives the port unchanged.
+        if (cfg_.exist_room_prior and fitter_->has_room_polygon() and not inst.is_bearing_hypothesis)
+        {
+            // The APERTURE centre, not the leaf's: a leaf swung OUTWARD moves the panel centre by w/2
+            // (0.45 m at the fitted w = 0.90 seen live) against RoomMarginM = 0.40, which would put a
+            // perfectly good door "outside the room" — and this branch `continue`s past the sensor
+            // channel, so nothing could rescue it before the 15-frame debounce deleted it.
+            const auto& ms = inst.model.state();
+            if (not fitter_->point_in_room(Eigen::Vector2f(ms.ap_cx, ms.ap_cy), cfg_.exist_room_margin_m))
+            {
+                inst.existence.set(inst.existence.logodds() - cfg_.exist_out_of_room_gain);
+                // A PRIOR is visibility-independent by construction (that is what the branch comment above
+                // argues), so it advances the debounce at FULL weight — unlike the sensor channel below.
+                if (rc::exist::decide_removal(inst.existence, inst.existence_debounce, policy, 1.0f).remove)
+                    to_remove.push_back(id);
+                continue;   // outside the room → no sensor evidence can rescue it; skip the normal channel
+            }
+        }
+
+        // MINIMUM-HEIGHT prior: same categorical prior as at birth, for an instance that is ALREADY alive —
+        // either it predates the birth check, or it drifted onto a low blob. A door is an aperture a person
+        // walks through, so a support that CONFIDENTLY tops out below MinHeightM says "this is not a door"
+        // no matter how well its silhouette is explained.
+        //
+        // obs_top_z accumulates untruncated views only, and obs_top_conf is the weight behind it, so a door
+        // whose top is always clipped by the image border never reaches MinHeightConf and is never judged —
+        // the prior stays silent rather than guessing. Not gated on visibility: like the room prior, this is
+        // a fact about what a door IS, so it applies whether or not the door is in view right now.
+        if (cfg_.exist_min_height_prior and not inst.is_bearing_hypothesis
+            and std::isfinite(inst.obs_top_z) and inst.obs_top_conf >= cfg_.exist_min_height_conf
+            and inst.obs_top_z < cfg_.exist_min_height_m)
+        {
+            inst.existence.set(inst.existence.logodds() - cfg_.exist_short_gain);
+            // Same as the room prior: a categorical fact about what a door IS, so it needs no visibility.
+            if (rc::exist::decide_removal(inst.existence, inst.existence_debounce, policy, 1.0f).remove)
+                to_remove.push_back(id);
+            continue;   // too short to be a door → no amount of silhouette agreement makes it one
+        }
+
+        // A bearing-only hypothesis has no depth (existence unjudgeable) and an un-initialised newborn has no
+        // silhouette to project — both HOLD.
+        if (inst.is_bearing_hypothesis or not inst.ai2_initialized)
+            continue;
+
+        // ── SILHOUETTE CHANNEL (the only one that may remove a door) ──────────────────────────────────
+        const auto sil = fitter_->compute_silhouette_existence(inst, &semantic_field_);
+
+        // ── RGB CONTOUR CHECK ────────────────────────────────────────────────────────────────────
+        // Does the IMAGE have a boundary where this door's own projected leaf face predicts one? No
+        // classifier is asked, so this does not go blind when ADE20K does — which is the entire reason
+        // it exists. Scored against the same quad displaced along the wall, so the number is "better
+        // than its own neighbours", not an absolute that would need a per-scene constant.
+        // ★LIVE, not diagnostic: the delta computed below is integrated into inst.existence. (This line
+        // said "DIAGNOSTIC ONLY, wired into no belief" long after that stopped being true — it was
+        // written when the channel was first measured and never updated when it was armed.)
+        // ★THE CONTOUR CHECK ABSTAINS ONCE THE LEAF LEAVES THE WALL PLANE.
+        // Its null is "the same quad displaced sideways ALONG THE WALL", which is only a comparison
+        // between like and like while the contour lies IN that wall. A swung leaf is out of the wall,
+        // so the displaced copies stop sampling wall and start sampling the open doorway and the room
+        // beyond — both edge-rich. Measured 2026-09-09 with phi at 35-45 deg: s_true fell below
+        // s_control, excess went negative, and the channel contributed dL -1.4 to -2.6 EVERY cycle
+        // while the silhouette was reporting occ 255 against free 15. It deleted the door it exists to
+        // defend, and it did so most confidently exactly when the door was open.
+        //
+        // The test is geometric, not a tuned angle: the leaf is "in the wall" while its free edge has
+        // displaced across the wall by less than the wall's own thickness. Beyond that the control
+        // construction is invalid and the honest contribution is NONE — abstaining is a statement about
+        // where this measurement is defined, not a way of ignoring inconvenient evidence.
+        // ⚠The proper fix is a null built from the leaf's OWN kinematics — the same leaf at a DIFFERENT
+        // phi — which is valid at any angle and is the same comparison estimate_phi already makes.
+        // ★NO ABSTENTION ANY MORE. It was introduced because the controls were displaced along the wall
+        // IN IMAGE SPACE, a null valid only for a flush leaf — but it was gated on phi, and phi wanders
+        // to 20-31 deg on a door that is shut, so the channel stood down almost always and stopped
+        // defending the door it was built for. (It DID defend it before phi became a DOF: dL +2.83
+        // through 180 fully-blind cycles, which is the behaviour this restores.)
+        // The controls now come from door_fitter, built by sliding the quad along the LEAF'S OWN plane
+        // in 3-D and reprojecting — identical at phi = 0, still valid at any angle. So the null holds
+        // open or shut, and there is nothing to gate.
+        rc::edges::ContourEdgeScore edge{};
+        if (cfg_.rgb_contour_check and rgb_ingestor_ and not rgb_ingestor_->frame().empty()
+            and sil.contour.face.valid() and not sil.contour.controls.empty())
+        {
+            const cv::Mat& img = rgb_ingestor_->frame();
+            std::vector<std::vector<cv::Point>> ctl;
+            ctl.reserve(sil.contour.controls.size());
+            for (const auto& c : sil.contour.controls)
+                ctl.push_back(c.px);
+            edge = rc::edges::contour_edge_support(img, sil.contour.face.px, ctl);
+        }
+        // ── THE METRIC HALF ─────────────────────────────────────────────────────────────────────────
+        // The RGB check confirms "a rectangular thing with these borders is here" — its own header says
+        // so, and a poster, a door-shaped panel or a cupboard front all pass it. Depth is the observable
+        // that separates them: a photograph of a door has the borders and none of the step. It asks the
+        // model's own question rather than an edge detector's — is the surface at the DISTANCE the belief
+        // predicts, and does the world recede behind its boundary — so it is absolute where the RGB
+        // statistic is relative, and it needs no control to refute.
+        rc::edges::ContourDepthScore depth{};
+        // ★contour_depth_check gates ONLY this half. Left off, `depth` stays default-constructed with
+        // n_samples == 0, so every consumer below reduces to RGB-only by its own existing logic: the
+        // summed verdict becomes edge.excess alone, and the depth-stands-alone branch cannot fire. No
+        // separate "disabled" path to keep in step — which is the point of gating the measurement
+        // rather than the integration.
+        if (cfg_.rgb_contour_check and cfg_.contour_depth_check
+            and depth_ingestor_ and not depth_ingestor_->frame().empty()
+            and sil.contour.face.valid())
+        {
+            rc::edges::ContourDepthParams dp;
+            const cv::Mat& dimg = depth_ingestor_->frame();
+            const int fc = rgb_ingestor_ ? rgb_ingestor_->frame().cols : dimg.cols;
+            const int fr = rgb_ingestor_ ? rgb_ingestor_->frame().rows : dimg.rows;
+            dp.depth_scale_x = (fc > 0) ? static_cast<float>(dimg.cols) / fc : 1.0f;
+            dp.depth_scale_y = (fr > 0) ? static_cast<float>(dimg.rows) / fr : 1.0f;
+            depth = rc::edges::contour_depth_support(dimg, sil.contour.face, sil.contour.controls, dp);
+        }
+        inst.dbg_depth_verdict = depth.verdict;
+        inst.dbg_depth_bias_m  = depth.mean_bias_m;
+        inst.dbg_depth_n       = depth.n_samples;
+        inst.dbg_edge_support = edge.support;
+        inst.dbg_edge_excess  = edge.excess;
+        inst.dbg_edge_nctl    = edge.n_controls;
+        inst.dbg_edge_true    = edge.s_true;
+        inst.dbg_edge_ctrl    = edge.s_control;
+        inst.dbg_edge_n       = edge.n_samples;
+        inst.dbg_sil_occ = sil.e_occ;     inst.dbg_sil_free  = sil.e_free;
+        inst.dbg_phi_marg = sil.phi_marginalised; inst.dbg_phi_nhyp = sil.phi_n_hyp;
+        inst.dbg_phi_wmax = sil.phi_w_max;
+        inst.dbg_sil_ndet = sil.n_detectable; inst.dbg_sil_ntotal = sil.n_total;
+        inst.dbg_sil_noccl = sil.n_occluded;  inst.dbg_sil_ncells = sil.n_cells;
+        inst.dbg_sil_central = sil.central_frac(); inst.dbg_sil_resolv = sil.resolvability();
+        // ★"WAS IT LOOKED AT" IS A QUESTION ABOUT THE DOOR, NOT ABOUT ONE GUESS AT ITS HINGE ANGLE.
+        // probed() answers it under the phi posterior, so a leaf the fit happened to swing out of frame
+        // is not mistaken for a door the camera never pointed at. See DoorSilhouette::probed().
+        if (not sil.probed())
+        {
+            // NOT PROBED this frame — behind the robot, out of the frustum, or fully occluded. rc::exist HOLDs.
+            // This branch is the whole fix for "the door disappears when the robot turns around": there is no
+            // pd to fall back on, because a sensor that did not look produces no evidence either way.
+            inst.dbg_sil_pdetect = 0.0f; inst.dbg_sil_free_eff = 0.0f;
+            continue;
+        }
+
+        // OCCUPANCY, weighted by how much of its mask the door MODEL actually explains. last_clutter_frac is the
+        // mixture's clutter responsibility — the same per-point posterior the free energy is built from — so a
+        // blob the door model fits none of confirms nothing. This is the missing term that let door_2 (FE 1.33
+        // vs 0.17 for the real door, clutter 0.38 → 0.98) climb to L=2.29 and then sit there: the old channel
+        // scored point MASS, never fit QUALITY. Stale between wins, but e_occ is only non-zero on a frame whose
+        // door mask overlaps this silhouette, i.e. one where the instance is being detected.
+        const float q_explain = std::clamp(1.0f - inst.last_clutter_frac, 0.0f, 1.0f);
+        const float e_occ = sil.e_occ * q_explain;
+
+        // ABSENCE. Suppressed entirely when the door was DETECTED this frame by any sensor (it is not gone —
+        // a ZED false-negative, or a door only the ricoh resolved, must never vote itself away). This is the
+        // honest form of "ricoh confirms, never removes": the old code enforced it on the positive side while
+        // the negative side removed through range_detectability, which is precisely the ricoh's own reach.
+        const bool observed = inst.frames_since_detection == 0;
+        // ★A frame that may not MOVE the geometry may not DESTROY the object either. `dbg_gated` is the fit's
+        // own admissibility verdict (door_fitter.cpp: truncated mask, or the robot moving with the mask
+        // off-centre ⇒ predict-only). When it is set the belief is FROZEN, so the projected silhouette is a
+        // stale panel compared against a live image and any mismatch measures our registration, not the door's
+        // existence. Ported from refrigerator_concept, where the absence of this rule deleted a healthy fridge
+        // in 5 s: the robot drove 2.3 m → 1.15 m, the motion gate froze the belief, and the frozen box stopped
+        // projecting onto a mask that was still arriving with ~55000 points. Every cycle that contributed
+        // removal evidence had gated=1. Occupancy is untouched — a lit sample can only ever confirm.
+        // ⚠A phantom is now only removable from an admissible viewpoint; removal waits for a good look.
+        //
+        // ★2026-08-07 — THE GUARD MUST READ THE GATE'S *FRESHNESS*, NOT THE BARE VERDICT (same defect table_concept
+        // fixed on 08-06). `run_inference` returns early when no mask reaches the fit, so `dbg_gated` — and the
+        // `last_trunc_frac` it is computed from — are STALE on exactly the cycles this guard fires: they are the
+        // verdict of whenever the door was last SEEN. A phantom is by definition never seen again, so one
+        // truncated frame at birth pinned dbg_gated=true for the rest of its life and its absence evidence was
+        // zeroed for good — the channel demanded a good mask on the door in order to believe there is no mask on
+        // the door. Live proof (etc/door_existence_log.csv, door_3 phantom at (1.82,−4.57), robot parked and
+        // staring at it): n_detectable 409/420, e_free 409, occ 0, central 0.76, p_detect 0.76 — a textbook
+        // resolving look — yet sil_free_eff ≡ 0.00, remove_streak ≡ 0 and L pinned at the +4 clamp for 1928
+        // frames, because trunc=0.155 > TruncGateFrac 0.10 was carried over from its last detection.
+        // Reading gate_fresh makes the guard mean what its comment always claimed: it suppresses absence only
+        // when THIS frame's fit really was frozen while a mask was in fact arriving.
+        const bool view_untrustworthy = inst.dbg_gate_fresh and (inst.dbg_trunc_gated or inst.dbg_motion_gated);
+        const float raw_free = (observed or view_untrustworthy) ? 0.0f : sil.e_free;
+        // P(detect | present, geometry): could this view have resolved a door that IS there?
+        //   resolvability — is the panel big enough in the image to segment (range × foreshortening),
+        //   in_fov_frac  — how much of it the real frustum + occluders actually left visible,
+        //   central_frac — whether the robot is LOOKING at it rather than clipping the frustum edge.
+        // Predicted-but-absent counts toward REMOVAL only in proportion to p_detect; the remainder is epistemic
+        // surprise ("I cannot resolve this from here"), which should send the robot to look, never delete.
+        //
+        // ★ p_detect scales the SATURATED delta, not the raw pixel COUNT. Scaling the count does not work:
+        // mask_evidence tanh-saturates the summed log-odds, and with hundreds of samples the sum sits far
+        // past the knee, so p_detect changes almost nothing until it hits exactly 0 — at which point the
+        // absence term vanishes entirely and the channel becomes a monotonic CONFIRMER. That is precisely
+        // what the live log showed: central_frac ≡ 0 ⇒ p_detect ≡ 0 ⇒ sil_free_eff ≡ 0, so the phantom at
+        // (−4.22,−2.16) sat at L = 4.0 with 230 of its 420 silhouette samples unlit, forever. (Same defect
+        // family as the table's "p_detect inert" — see the dining-set fix, which is where this form comes
+        // from.) Scaling the SATURATED delta by p_detect makes it act linearly over its whole range, and keeps
+        // confirmation (+) untouched. (It once interpolated from a confirm-only FLOOR; that floor was removed
+        // — see the note at ev.log_odds_delta below — so the confirm-only delta is no longer computed.)
+        //
+        // ★THE DETECTOR ENVELOPE, which this channel was documented to use and did not. door_config.h's
+        // own comment says "the removal channel weights absence by it, so a missing mask from a pose the
+        // detector could never fire from reads as EXPECTED rather than as evidence the object is gone" —
+        // but only the epistemic planner ever read it. The three geometric factors above all IMPROVE
+        // monotonically as a face-on door gets closer, so p_detect climbed toward 1 exactly where the
+        // detector was failing hardest.
+        //
+        // Measured 2026-09-08 over one approach, 198 distinct viewpoints, de-duplicated by pose:
+        //     roi_fill 0.15-0.20 -> fired 31%   |  p_detect said 0.44
+        //     roi_fill 0.20-0.25 -> fired 90%   |               0.67
+        //     roi_fill 0.25-0.30 -> fired 55%   |               0.80
+        //     roi_fill 0.30-0.35 -> fired 23%   |               0.97
+        // Detectability is UNIMODAL in fill and the geometric product is monotone: the wrong SHAPE, not
+        // wrong constants. Past ~4 m of range (fill ~0.31) absence was charged ~4x harder than the truth,
+        // which is what drove L to its -4.00 clamp and deleted a door in plain view.
+        //
+        // visible_frac is passed as 1.0 on purpose: occlusion/frustum loss is already carried by
+        // in_fov_frac() below, and passing it twice would square it.
+        const rc::detect::DetectorEnvelope env{cfg_.detect_min_fill, cfg_.detect_max_fill, cfg_.detect_soft};
+        const float p_env = rc::detect::p_detect(inst.roi_fill, 1.0f, env);
+        // ★OBLIQUITY OF THE LEAF, which only became a live variable when phi did. A panel seen edge-on
+        // presents almost no area to segment: |ray . leaf face normal| falls from 0.99 at phi=5 deg to
+        // 0.43 at 60 deg and 0.21 at 85 deg. door_view_obliquity() has computed exactly this all along —
+        // against inst.leaf_pose.ey, so it follows the leaf — and was labelled "diagnostic only" and
+        // never used. With phi pinned at 0 that was harmless: a flush door is always face-on, the term
+        // is ~1, and it changed nothing. The moment the leaf can swing it becomes the dominant
+        // detectability factor, and leaving it out charges a full-strength absence against a look that
+        // physically could not have resolved the door.
+        //
+        // Measured 2026-09-09 on the deaths: absence was charged at p_detect 0.55 with the leaf at 37
+        // deg and 0.28 at 60 deg; with obliquity those become 0.39 and 0.12.
+        //
+        // ⚠It cuts BOTH ways, as every p_detect does: an edge-on leaf can no longer refute the door,
+        // and also can no longer defend it. That is the honest reading of an unresolvable view, but it
+        // is the same shape as the documented hood failure, so a door believed permanently edge-on
+        // would be hard to remove. The aperture-side evidence is what has to keep that in check.
+        const float leaf_oblq = fitter_->door_view_obliquity(inst);
+        float p_detect = p_env * leaf_oblq * sil.resolvability() * sil.in_fov_frac() * sil.central_frac();
+
+        // ★THE CONTOUR CHECK. Everything above is geometry: it says how well the camera could have
+        // resolved the door IN PRINCIPLE. This asks what the classifier actually computed AT the door's
+        // own projected pixels, which is the only place the question is really settled.
+        //
+        // The statistic is a CONTRAST, not an absolute. At 4.2 m over a plainly visible door the field
+        // reads P(door)=0.265 while calling it `wall` at 0.676 — so "P(door) is high" would fail on the
+        // exact case this exists for. What still holds is WHERE the door-ness sits: if the contour is
+        // markedly more door-like than the rest of the frame, the door is where the belief says it is,
+        // even while the argmax disagrees.
+        //
+        //     support = mean P over contour / (mean P over contour + mean P over the whole field)
+        //
+        // 0.5 means the contour is no more door-like than anywhere else — the look said nothing, and
+        // absence must not be charged for it. Above 0.5 the contour is concentrated door-ness and
+        // absence is damped in proportion. BELOW 0.5 the contour is LESS door-like than background,
+        // which is genuine evidence against, and absence is charged in full — that asymmetry is what
+        // keeps this a test the belief can fail rather than a shield it wears.
+        //
+        // ★No threshold, and no constant: the 0.5 is the neutral point of a ratio, not a tuned cutoff.
+        float field_support = 0.5f;
+        if (sil.field_n > 0 and sil.field_bg > 0.0f)
+        {
+            const float in = sil.field_mean();
+            field_support = in / (in + sil.field_bg);
+            // ★NO LONGER ACTS. It damped p_detect until 2026-09-09, and that was wrong twice over.
+            //  (1) It could only ever HOLD, never DEFEND: integrate() collapses to the confirm-only term
+            //      as p_detect -> 0, and that term is zero on a frame with no detection. The belief sat
+            //      at p_exists 0.03 while the node survived — a corpse that could not be buried.
+            //  (2) The background is the whole frame, which is mostly floor and ceiling at P(door)~0.015,
+            //      so `support` saturated at 0.98 for any contour touching anything door-ish. p_detect
+            //      collapsed to ~0.017 and STARVED decide_removal's accumulator, which measures the
+            //      debounce in ideal observations — so a genuine phantom became unremovable too.
+            // It stays computed and logged because it is an excellent DIAGNOSTIC: watching fld_in fall
+            // 0.935 -> 0.485 -> 0.058 is what showed the classifier going blind in real time. The
+            // defending is now done by the RGB contour channel below, which is not derived from the
+            // classifier and therefore does not go blind with it.
+        }
+        inst.dbg_field_support = field_support;
+        inst.dbg_field_mean    = sil.field_mean();
+        inst.dbg_field_bg      = sil.field_bg;
+        inst.dbg_field_n       = sil.field_n;
+        inst.dbg_sil_pdetect = p_detect; inst.dbg_sil_free_eff = raw_free * p_detect;
+
+        const float d_full = rc::exist::mask_evidence(e_occ, raw_free, sil.n_detectable, sm).log_odds_delta;
+        rc::exist::Evidence ev;
+        ev.e_occ = e_occ; ev.e_free = raw_free; ev.n_reached = sil.n_detectable;
+        // Interpolate from ZERO, not from the occupancy-only floor — see the note in
+        // refrigerator_existence.cpp: the old form left a positive push at p_detect -> 0, which is the
+        // ratchet that makes a phantom immortal. A probe that could not resolve the object is a HOLD.
+        ev.log_odds_delta = p_detect * d_full;
+        // p_detect is passed EXPLICITLY: log_odds_delta already carries it, but the second argument is also
+        // what the frame-correlation weighting reads (rho_eff = rho*(1-p_detect)). Defaulting it to 1.0 told
+        // the belief every miss was a maximally-unambiguous look, so consecutive correlated misses counted as
+        // independent. Inert while Existence.FrameCorrelation is 0, but wrong the moment it is measured.
+        inst.existence.integrate(ev, p_detect);
+
+        // ── RGB CONTOUR CHANNEL: an INDEPENDENT sensor, integrated separately ────────────────────────
+        //
+        // Measured 2026-09-09 across a death, on this door: as the robot closed, the semantic posterior
+        // under the contour fell 0.935 -> 0.485 -> 0.058 while the image's across-boundary gradient on
+        // that same contour ROSE, s_true 47 -> 58 against controls falling 16 -> 11 (support 0.75 ->
+        // 0.84, on 150 -> 267 boundary samples). The door's jamb and lintel become MORE distinct as you
+        // approach; only the network's label collapses. So this channel carries information exactly
+        // where every classifier-derived one is empty.
+        //
+        // ★SYMMETRIC, which is what makes it a test and not a shield. Above 0.5 the contour is more
+        // distinct than the same shape displaced along the wall -> occupancy. Below 0.5 it is LESS
+        // distinct -> free, at the same weight. The magnitude is how decisive the image was, and 0.5 is
+        // the neutral point of a ratio rather than a tuned cutoff.
+        //
+        // ★n_reached is the count of boundary samples actually scored, so a contour half out of frame
+        // contributes proportionally less on its own, with no special case.
+        //
+        // ★p_detect = 1: for THIS channel, having scored the boundary IS having resolved the question.
+        // Its detectability is already carried by n_reached and by edge_n == 0 meaning "not measured".
+        //
+        // ⚠CORRELATION, stated because the framework has no term for it: this and the silhouette channel
+        // are different measurements (geometric boundary vs semantic label) but not independent events —
+        // both depend on the door being there, so on a frame where a mask IS present both push positive.
+        // The +/-4 log-odds clamp bounds the resulting overconfidence; a proper common-mode treatment
+        // (as the mask-point Woodbury marginalisation does for sigma) is the right long-term fix.
+        if (inst.dbg_edge_n > 0 and edge.n_controls > 0)
+        {
+            // ★DIFFERENCE, NOT RATIO, and NOT through mask_evidence. Both halves are scars:
+            //  · The ratio form threw away magnitude, so a near-blank frame (s_true 5.2 against controls
+            //    7.8) produced support 0.400 and a full-strength refutation that deleted a live door.
+            //    The excess for that same frame is -0.26: weak, which is the truth.
+            //  · Routing through mask_evidence() applied its tanh common-mode cap, and my sample counts
+            //    (75-182) sat so far past its knee that EVERY cycle clipped to the identical +-2.83.
+            //    The graded weight I thought I had was a binary vote on the sign. Measured: the log
+            //    contained exactly two distinct dL values across the whole run.
+            // The conversion is now rc::exist::contour_evidence (MODALITY 3), which is that reasoning
+            // written once for the fleet: scaled by ONE confident observation's worth, log(pd/pc), the
+            // same quantity every other channel is denominated in, with tanh bounding the cycle rather
+            // than quantising it. The gate stays HERE because it is this channel's own precondition —
+            // the RGB statistic is relative and means nothing without a surviving control.
+            // ★THE TWO HALVES SUM INSIDE ONE tanh, and that IS the common-mode treatment. A boundary in
+            // the image and a step in the depth at the same place are not independent events — both are
+            // consequences of the door being there — so letting each contribute a full observation's
+            // worth would count one fact twice. Both are dimensionless and bounded, so the sum is well
+            // defined, and one confident observation still bounds the cycle.
+            // ★CONFIRM-ONLY: this channel may RAISE the belief and never lower it, and that asymmetry is
+            // stated, not tuned. A contour that MATCHES is evidence the door is there. A contour that does
+            // NOT match is evidence our POSE is wrong — the leaf is not at the angle we drew it at — which
+            // is a fit error and none of the existence channel's business. The channel was introduced for
+            // exactly the first job: positive evidence that stops a blind detector from removing a door.
+            // ★MEASURED, AND IT IS NOT A SMALL EFFECT. With the leaf tracked to its true ~97 deg the
+            // contour scores a foreshortened quad out in the room against copies of itself displaced
+            // along a wall that is no longer behind it, and the excess flips sign nearly every cycle:
+            // -2.35 +0.85 -5.80 -5.68 +2.40 +1.11 -4.29 ... -7.48 over consecutive frames, up to 7.5 nats
+            // from ONE frame against a band only 8 wide. The silhouette channel was healthy throughout
+            // (free_eff 0, occ 92, detector firing) — the belief was being thrown across its whole range
+            // by a measurement with no notion of its own reliability.
+            // ⚠THE PROPER FIX IS PRECISION, NOT A CLAMP: the excess is a difference of means whose own
+            // spread across the control placements is discarded, so a wild measurement and a confident
+            // one currently weigh the same. Returning that spread and weighting by it would let a noisy
+            // contour contribute little in BOTH directions, which is strictly better than refusing one
+            // direction. This asymmetry is the honest interim: it cannot make the door immortal — the
+            // silhouette channel still removes, and it is the one with a detectability model.
+            const float verdict = std::max(0.0f, edge.excess) + depth.verdict;
+            const rc::exist::Evidence ev_rgb =
+                rc::exist::contour_evidence(verdict, std::max(inst.dbg_edge_n, depth.n_samples), sm);
+            inst.existence.integrate(ev_rgb, 1.0f);
+            inst.dbg_edge_delta = ev_rgb.log_odds_delta;
+        }
+        else if (depth.n_samples > 0)
+        {
+            // ★THE DEPTH HALF STANDS ALONE when the RGB half cannot speak — no surviving control, or no
+            // RGB frame at all. Its statistic is absolute, so it does not need the null the gradient
+            // check does, and making it wait for one would silence the only channel that can say "we are
+            // looking straight through the place the door is supposed to be".
+            const rc::exist::Evidence ev_d =
+                rc::exist::contour_evidence(depth.verdict, depth.n_samples, sm);
+            inst.existence.integrate(ev_d, 1.0f);
+            inst.dbg_edge_delta = ev_d.log_odds_delta;
+        }
+        else
+            inst.dbg_edge_delta = 0.0f;   // not measured, and no surviving control — NOT a refutation
+
+        // Debounce on consecutive EVIDENCE cycles (not wall-clock), so a transient hiccup cannot delete a real
+        // door, and removal always reflects sustained agreement across frames.
+        // ★DEBOUNCE ON LOOKS, NOT CYCLES. `++` counted every cycle in which the decision said remove — including
+        // the ones where p_detect was 0 and the channel had just, correctly, HELD. So a door that dipped below
+        // the boundary once was deleted `RemoveFrames` cycles later no matter what happened in between, and the
+        // live record shows exactly that: 12 of 12 door deaths had fixated=0, five at p_detect=0.000, at ranges
+        // of 2.1-6.7 m. Accumulating p_detect makes the debounce measure how much genuine LOOKING has happened,
+        // so RemoveFrames is a number of IDEAL observations - the same unit table and bottle use.
+        // ★And RemoveFrames is what is demanded AT the boundary. Charging the full count of ideal observations
+        // AFTER L has already crossed double-counts the same evidence and is what freezes a condemned door
+        // forever once the robot looks away; the shared policy lets confidence discharge the repetition.
+        const auto verdict = rc::exist::decide_removal(inst.existence, inst.existence_debounce, policy, p_detect);
+        if (verdict.remove)
+            to_remove.push_back(id);
+        if (verdict.stalled)
+            std::print("door_concept: {}\n", rc::exist::stall_note(inst.node_name, inst.existence,
+                                                                   inst.existence_debounce, verdict));
+
+        // ★AND THE MIRROR CASE, structurally unreportable until 2026-08-15: NOT condemned, and nothing
+        // has resolved it for a long time. `stalled` is computed AFTER decide_removal's not-condemned
+        // early return, so a belief pinned at the +4 clamp by evidence no look can contradict said
+        // NOTHING — a phantom refrigerator held there by a DOOR's returns sat silent for an hour with
+        // streak 0 on all 9714 rows. A REPORT only; nothing branches on it.
+        if (verdict.unfalsifiable)
+            std::print("door_concept: {}\n",
+                       rc::exist::unfalsifiable_note(inst.node_name, inst.existence, verdict));
+    }
+
+    // Existence readout. Throttled to 1-in-60 so a "why is this phantom still here?" case stays
+    // diagnosable without flooding — but ★THE THROTTLE MUST NOT SWALLOW THE EVENT THE FILE EXISTS FOR.
+    //
+    // Three removals tonight were invisible: the last sampled row read L +4.00, occ 420, free 0,
+    // free_eff 0.00, won 1, edge_dL +2.83 — every channel positive — and 60 cycles later the door was
+    // gone at L -4.00. Eight nats crossed INSIDE one sampling interval, so the transition that actually
+    // did it was never written down, and the min-height and room-containment priors could only be
+    // eliminated by inference rather than read off. A log that samples uniformly is the wrong shape for
+    // a question about a transient: it records the steady states either side of the thing you want.
+    //
+    // So a row is forced whenever the belief MOVES sharply (|dL| > 1 nat in one cycle) or is about to
+    // be removed, regardless of the counter. Rare by construction — a healthy door sits at its clamp —
+    // and it costs nothing on the cycles where nothing happens.
+    static int ex_dbg = 0;
+    ++ex_dbg;
+    static std::unordered_map<std::uint64_t, float> last_L;
+    std::unordered_set<std::uint64_t> force_row;
+    for (const auto& [id, inst] : fitter_->instances())
+    {
+        if (inst.is_bearing_hypothesis) continue;
+        const float L = inst.existence.logodds();
+        if (const auto it = last_L.find(id); it != last_L.end() and std::abs(L - it->second) > 1.0f)
+            force_row.insert(id);
+        last_L[id] = L;
+    }
+    for (const auto id : to_remove)     // the removal cycle itself, always
+        force_row.insert(id);
+    for (const auto& [id, inst] : fitter_->instances())
+        if (not inst.is_bearing_hypothesis and (ex_dbg % 60 == 0 or force_row.contains(id)))
+            {
+                const auto& ms = inst.model.state();
+                const bool has_poly = fitter_->has_room_polygon();
+                const bool inroom = (not has_poly)
+                                    or fitter_->point_in_room(Eigen::Vector2f(ms.cx, ms.cy), cfg_.exist_room_margin_m);
+                const float oblq = fitter_->door_view_obliquity(inst);   // diagnostic only (see door_fitter.h)
+                std::print("door_concept: [existence] {} L={:.2f} p={:.2f} pos=({:.2f},{:.2f}) inroom={} roomprior={} "
+                           "won={} since_det={} | sil occ={:.0f} free={:.0f} free_eff={:.1f} ndet={}/{} occl={} "
+                           "resolv={:.2f} central={:.2f} pdet={:.2f} oblq={:.2f} gate={}/{} strk={}"
+                           // The RGB-reprojection contour channel, on the line where pdet is read: without
+                           // these three, pdet=0.02 beside resolv=0.60 central=0.98 is unexplainable from
+                           // the terminal (0.60*0.98 = 0.59, not 0.02) and looks like a bug in the geometry.
+                           // fld_n=0 means the field was UNAVAILABLE, which is not the same as no support.
+                           " | fld n={} in={:.3f} bg={:.3f} sup={:.3f}"
+                           // The classifier-free channel, beside the classifier one. When these two
+                           // disagree — edge high while P(door) collapses — the disagreement IS the
+                           // finding, and it was previously only visible by joining two files afterwards.
+                           " | edge n={}/{}ctl sup={:.2f} exc={:+.2f} (t={:.0f} c={:.0f}) dL={:+.2f}"
+                           " | phi={:.1f}deg sup={:.2f} cmd={}\n",
+                           inst.node_name, inst.existence.logodds(), inst.existence.p_exists(), ms.cx, ms.cy,
+                           inroom ? 1 : 0, has_poly ? 1 : 0,
+                           inst.assigned_mask_idx >= 0 ? 1 : 0, inst.frames_since_detection,
+                           inst.dbg_sil_occ, inst.dbg_sil_free, inst.dbg_sil_free_eff,
+                           inst.dbg_sil_ndet, inst.dbg_sil_ntotal, inst.dbg_sil_noccl,
+                           inst.dbg_sil_resolv, inst.dbg_sil_central, inst.dbg_sil_pdetect, oblq,
+                           inst.dbg_gated ? 1 : 0, inst.dbg_gate_fresh ? 1 : 0,
+                           inst.existence_debounce.streak,
+                           inst.dbg_field_n, inst.dbg_field_mean, inst.dbg_field_bg, inst.dbg_field_support,
+                           inst.dbg_edge_n, inst.dbg_edge_nctl, inst.dbg_edge_support, inst.dbg_edge_excess,
+                           inst.dbg_edge_true, inst.dbg_edge_ctrl, inst.dbg_edge_delta,
+                           inst.phi_est * 180.0f / static_cast<float>(M_PI), inst.phi_support,
+                           inst.phi_cmd_active ? 1 : 0);
+                // Minimum-height evidence: obs_top is the support top over UNTRUNCATED views only, so a door
+                // whose top is always clipped by the image border shows conf→0 and is never judged short.
+                std::print("door_concept: [existence] {} obs_top={:.2f} m (conf {:.2f}, trunc {:.2f}) min={:.2f} m\n",
+                           inst.node_name, inst.obs_top_z, inst.obs_top_conf, inst.last_trunc_frac,
+                           cfg_.exist_min_height_m);
+                // Same diagnostic to a CSV. How to read it: ndet=0 ⇒ the door was NOT looked at (out of frustum
+                // or fully occluded) ⇒ HOLD, L must not move — that is the "robot turned around" case. A real
+                // door in view shows occ≫free. A phantom in a resolving view (pdet high) shows free≫occ and a
+                // rising strk. free_eff≪free means "seen, but this view could not resolve it" ⇒ go verify, not delete.
+                static std::ofstream ex_csv = []{ std::ofstream f; rc::diag::open_rotating(f, "etc/door_existence_log.csv");
+                    f << "cycle,node,L,p_exists,cx,cy,inroom,roomprior_loaded,won,since_det,"
+                         "sil_occ,sil_free,sil_free_eff,n_detectable,n_total,n_occluded,"
+                         "resolvability,central_frac,p_detect,oblq,remove_streak,"
+                         "obs_top_z,obs_top_conf,trunc,gated,gate_fresh,"
+                         // Contour check against retina's graded posterior. ★fld_n==0 means the field
+                         // was UNAVAILABLE and this cycle behaved exactly as it did before the channel
+                         // existed — a different fact from "no support found", which is fld_sup<=0.5.
+                         "fld_sup,fld_in,fld_bg,fld_n,"
+                         // RGB contour check (classifier-free). edge_n==0 ⇒ NOT MEASURED.
+                         "edge_sup,edge_true,edge_ctrl,edge_n,edge_dL,edge_exc,edge_nctl,"
+                         // DEPTH half of the same channel — the one a poster of a door cannot pass.
+                         // dep_n==0 ⇒ NOT MEASURED (no depth plane, or no valid reads along the
+                         // contour), which is NOT the same as dep_v==0 (measured, and it says nothing:
+                         // a surface at the predicted distance with nothing behind it, i.e. flat wall).
+                         // dep_bias is SIGNED (observed − predicted, m): a channel scoring low with a
+                         // large bias is a FIT error, not an absence, and only this column separates them.
+                         "dep_v,dep_bias,dep_n,"
+                         // M1: the leaf angle is estimated now, not pinned. phi_support is how much of
+                         // the leaf face the image actually backs at that angle; phi_cmd=1 means a swing
+                         // WE commanded is being anticipated, which is legitimately evidence-free.
+                         // phi_marg=1 ⇒ the occ/free split above is the MARGINAL over the opening
+                         // angle, not a single-angle rendering. phi_wmax is the largest normalised
+                         // weight: ~1/phi_nhyp means the frame could not identify the angle at all, so
+                         // the absence was averaged across hypotheses and is correctly near zero.
+                         "phi,phi_support,phi_cmd,phi_marg,phi_nhyp,phi_wmax\n"; return f; }();
+                if (ex_csv)
+                {
+                    ex_csv << ex_dbg << ',' << inst.node_name << ',' << inst.existence.logodds() << ','
+                           << inst.existence.p_exists() << ',' << ms.cx << ',' << ms.cy
+                           << ',' << (inroom ? 1 : 0) << ',' << (has_poly ? 1 : 0)
+                           << ',' << (inst.assigned_mask_idx >= 0 ? 1 : 0) << ',' << inst.frames_since_detection
+                           << ',' << inst.dbg_sil_occ << ',' << inst.dbg_sil_free << ',' << inst.dbg_sil_free_eff
+                           << ',' << inst.dbg_sil_ndet << ',' << inst.dbg_sil_ntotal << ',' << inst.dbg_sil_noccl
+                           << ',' << inst.dbg_sil_resolv << ',' << inst.dbg_sil_central << ',' << inst.dbg_sil_pdetect
+                           << ',' << oblq << ',' << inst.existence_debounce.streak
+                           << ',' << inst.obs_top_z << ',' << inst.obs_top_conf << ',' << inst.last_trunc_frac
+                           // gated=1 with gate_fresh=0 is the stale-verdict trap: the flag is left over from the
+                           // last frame that carried a mask, and must NOT suppress absence (see view_untrustworthy).
+                           << ',' << (inst.dbg_gated ? 1 : 0) << ',' << (inst.dbg_gate_fresh ? 1 : 0)
+                           << ',' << inst.dbg_field_support << ',' << inst.dbg_field_mean
+                           << ',' << inst.dbg_field_bg << ',' << inst.dbg_field_n
+                           << ',' << inst.dbg_edge_support << ',' << inst.dbg_edge_true
+                           << ',' << inst.dbg_edge_ctrl << ',' << inst.dbg_edge_n
+                           << ',' << inst.dbg_edge_delta << ',' << inst.dbg_edge_excess
+                           << ',' << inst.dbg_edge_nctl
+                           << ',' << inst.dbg_depth_verdict << ',' << inst.dbg_depth_bias_m
+                           << ',' << inst.dbg_depth_n
+                           << ',' << inst.phi_est << ',' << inst.phi_support
+                           << ',' << (inst.phi_cmd_active ? 1 : 0)
+                           << ',' << (inst.dbg_phi_marg ? 1 : 0) << ',' << inst.dbg_phi_nhyp
+                           << ',' << inst.dbg_phi_wmax << '\n';
+                    ex_csv.flush();
+                }
+            }
+
+    for (const std::uint64_t id : to_remove)
+    {
+        const auto it = fitter_->instances().find(id);
+        const float L = (it != fitter_->instances().end()) ? it->second.existence.logodds() : 0.0f;
+        std::print("door_concept: [existence] REMOVE id={} (L={:.2f}, p={:.3f} < {:.3f} for {} evidence cycles)\n",
+                   id, L, 1.0f / (1.0f + std::exp(-L)), cfg_.exist_removal_prob, cfg_.exist_remove_frames);
+        if (it != fitter_->instances().end())
+        {
+            // Retain the identity before deleting the node: a door that comes back at the same place is the SAME
+            // door, and must resume its accumulated belief instead of being re-born as door_N+1 (see remember_ghost).
+            remember_ghost(it->second);
+            log_tracker_event("REMOVE", id, it->second.model.state().cx, it->second.model.state().cy,
+                              std::format("logodds {:.2f}", L));
+            // Shadow-mode death record (§4.2), taken BEFORE teardown while the state that justified
+            // the kill is readable. Low p_detect here ⇒ our removal bug, not a classifier phantom.
+            log_phantom_event("DEATH", id, it->second.node_name,
+                              it->second.model.state().cx, it->second.model.state().cy, &it->second,
+                              std::format("L {:.2f}", L));
+            it->second.affordance.remove();
+            it->second.aff_approach.remove();   // and the three pragmatic siblings — see retire_instance
+            it->second.aff_open.remove();
+            it->second.aff_cross.remove();
+        }
+        fitter_->forget_node(id);
+        G->delete_node(id);
+    }
+}
+
+///////////////////////////////////////////////////////////////
+void SpecificWorker::process_door_node(const DSR::Node& node)
+{
+    const bool created = fitter_->ensure_instance(node, room_node_id_);
+    auto& inst = fitter_->instances().at(node.id());
+
+    if (created)
+    {
+        // Register per-instance time-series (Qt dashboards stay in the worker).
+        if (ts_plot_)
+        {
+            ts_plot_->add_series(inst.node_name + "_fe",  QColor(255, 170,   0), 1.1f);
+            if (ts_cov_plot_) ts_cov_plot_->add_series(inst.node_name + "_cov", QColor(  0, 190, 255), 1.1f);
+            if (ts_res_plot_) ts_res_plot_->add_series(inst.node_name + "_res", QColor(170,  80, 255), 1.1f);
+        }
+        place_door_on_canvas(node, inst);
+    }
+
+    // The RT parent is resolved lazily — a door is born hanging from the room and moves under a wall_*
+    // node as soon as one is near enough. Re-place it when that happens, or the canvas keeps drawing it
+    // where its FIRST parent was.
+    place_door_on_canvas(node, inst);
+
+    ++inst.processed_cycles;
+    const auto observation = fitter_->observe(inst, node);
+
+    // Stale check: skip heavy update if data hasn't moved for too long
+    if (not observation.has_fresh_data and inst.matched_frames < 5)
+        return;
+
+    const float free_energy = fitter_->run_inference(inst, observation);
+    publish_door_cycle(inst, node, observation, free_energy);
+}
+
+
+void SpecificWorker::publish_door_cycle(rc::DoorInstance& inst,
+                                         const DSR::Node& node,
+                                         const DoorObservation& observation,
+                                         float free_energy)
+{
+    const auto node_id = node.id();
+    if (not scene_graph_->persist_door_belief(inst, node_id, room_node_id_, free_energy))
+        return;
+    if (not assess_door_state(inst, node_id, free_energy))
+        return;
+    publish_door_diagnostics(inst, observation, free_energy);
+    publish_door_intentions(inst, node_id, observation, free_energy);
+}
+
+bool SpecificWorker::assess_door_state(rc::DoorInstance& inst, uint64_t node_id, float free_energy)
+{
+    auto node_opt = G->get_node(node_id);
+    if (not node_opt.has_value())
+        return false;
+
+    step_convergence(inst, node_opt.value(), free_energy);
+    return true;
+}
+
+void SpecificWorker::publish_door_diagnostics(const rc::DoorInstance& inst,
+                                               const DoorObservation& observation,
+                                               float free_energy)
+{
+    rc::dash::publish_belief_series({ts_plot_, ts_surprise_plot_, ts_cov_plot_, ts_res_plot_},
+                                   {.node = inst.node_name,
+                                     .free_energy  = free_energy,
+                                     .fe_baseline  = inst.fe_baseline,
+                                     .fe_surprise  = inst.fe_surprise,
+                                     .uncertainty  = belief_uncertainty(inst),
+                                     .residual_pts = static_cast<float>(inst.dbg_resid_pts)});
+
+    if (fitter_->should_log(inst))
+        std::print("[{}] series: FE={:.4f} U(Σ)={:.3f} res={}\n",
+                   inst.node_name, free_energy, belief_uncertainty(inst), observation.residual_pts.size());
+}
+
+void SpecificWorker::publish_door_intentions(rc::DoorInstance& inst,
+                                              uint64_t node_id,
+                                              const DoorObservation& observation,
+                                              float free_energy)
+{
+    // step_epistemic now owns the propose-vs-withdraw decision via the planner's ΔH (it withdraws
+    // when the expected information gain falls below threshold), so it runs unconditionally rather
+    // than being gated on the legacy coverage-deficit proxy.
+    if (auto node_opt = G->get_node(node_id); node_opt.has_value())
+        step_epistemic(inst, node_opt.value());
+}
+
+// ─── Initialisation helpers ──────────────────────────────────────────────────
+
+void SpecificWorker::load_config(const ConfigLoader& cfg)
+{
+    cfg_ = rc::load_door_config(cfg);
+}
+
+
+// ─── Per-cycle steps ─────────────────────────────────────────────────────────
+
+
+void SpecificWorker::step_convergence(rc::DoorInstance& inst,
+                                       DSR::Node& node,
+                                       float free_energy)
+{
+    // Convergence on STATE stability, not |ΔFE|: the free energy keeps jittering with queue
+    // churn / point-count even when the fitted geometry is settled, so it never latched. Track
+    // how much the accepted state moved between cycles instead.
+    const auto& s = inst.model.state();
+    const auto& p = inst.prev_conv_state;
+    // phi is in the sum so a door SWINGING cannot read as "converged" (its centre and yaw move together
+    // in a way the other terms alone under-report). Contributes exactly 0 while phi is pinned.
+    const float state_delta = inst.has_prev_conv_state
+        ? (std::abs(s.cx - p.cx) + std::abs(s.cy - p.cy) + std::abs(s.w - p.w) +
+           std::abs(s.h - p.h) + std::abs(s.yaw - p.yaw) + std::abs(s.phi - p.phi))
+        : std::numeric_limits<float>::max();
+    inst.prev_conv_state = s;
+    inst.has_prev_conv_state = true;
+
+    // The convergence RULE (counter, verdict, graph writes) is shared — common/obj/convergence.h. What stays
+    // here is the one per-object part: which DOFs enter state_delta, above.
+    const float model_uncertainty = belief_uncertainty(inst);
+    const bool stable_edge = rc::converge::step(*G, node, state_delta, model_uncertainty,
+                                                inst.frames_converged, inst.model_stable,
+                                                {cfg_.state_eps, cfg_.K_stable});
+    if (fitter_->should_log(inst))
+    {
+        const auto& cs = inst.model.state();
+        std::print("[{}] convergence: pos=({:.2f},{:.2f}) yaw={:.2f} Δstate={:.4f} stable={}/{} U(Σ)={:.3f}m\n",
+                   inst.node_name, cs.cx, cs.cy, cs.yaw, state_delta, inst.frames_converged, cfg_.K_stable,
+                   model_uncertainty);
+    }
+
+    if (stable_edge and inst.model_stable)
+        std::print("door_concept: node '{}' STABLE (F={:.4f})\n", inst.node_name, free_energy);
+}
+
+void SpecificWorker::step_epistemic(rc::DoorInstance& inst, DSR::Node& node)
+{
+    // Peripheral hypothesis (Part C-birth) — GLANCE or GO-AND-CHECK, decided by whether it has a RANGE.
+    //
+    //   · bearing only  → ORIENT: rotate in place down the ray. There is no trustworthy (x,y) to drive to,
+    //                     so proposing one would be inventing a destination. The broad along-ray Σ already
+    //                     makes the gain high, and one glance usually collapses it.
+    //   · with a range  → the normal Servo path: the hypothesis has a real (x,y), so the planner's viewpoint
+    //                     is meaningful and the affordance becomes "GO THERE and check". This is the rung the
+    //                     range cascade unlocks (door_bearing_range.h).
+    //
+    // Note this reads `hypothesis_range_known`, not the σ, deliberately: how MUCH the range is trusted is
+    // already carried by Σ into the planner's gain and stand-off, so a second σ test here would double-count.
+    const bool orient = inst.is_bearing_hypothesis and not inst.hypothesis_range_known;
+
+    // The cycle around the planner call is SHARED (common/epistemic_step). ★For door the important part of
+    // that move is the FIRST bail path: the not-yet-initialised belief used to `return` bare, leaving a
+    // just-completed affordance Completed for ever. Only the is_finite path held the offer; now both do,
+    // because the shared step has exactly one bail path.
+    rc::epistemic::StepHooks<rc::EpistemicProposal> hooks;
+
+    hooks.compute = [&]() -> std::optional<rc::EpistemicProposal>
+    {
+        // Σ-based D-optimal NBV from the belief. Skip until the belief has seen its first frame (else Σ is
+        // the broad prior and the proposal is moot).
+        if (not inst.ai2_initialized)
+            return std::nullopt;
+        // Obstacles = the other fitted objects PLUS THE WALLS. The walls are what makes an edge-on view of a
+        // door impossible, and without them the planner sent the affordance to a point ON the wall: the leaf's
+        // ±x faces have normals lying in the wall plane, so their viewpoints sit several metres along it (live
+        // 2026-08-07: `face=-x d=3.67m`). Furniture alone could never say that — `collect_graph_obstacles`
+        // reads only `object`/`box` nodes. With the wall present, a grazing sightline has to traverse metres
+        // of it and `visible_fraction` collapses continuously, so "view the door from a cone about its normal"
+        // is a CONSEQUENCE of the geometry rather than an angular rule anyone had to write down.
+        //
+        // Every known aperture is punched out of the run, this door's included — otherwise the wall would
+        // block the honest head-on views too, since the leaf sits inside the wall's own footprint. Other doors
+        // are gaps as well: you really can see through a doorway across the room.
+        auto obstacles = rc::nbv::collect_graph_obstacles(*G, inner_eigen_.get(), inst.node_id);
+        if (fitter_->has_room_polygon())
+        {
+            std::vector<rc::nbv::WallGap> gaps;
+            gaps.reserve(fitter_->instances().size());
+            for (const auto& [oid, other] : fitter_->instances())
+            {
+                if (other.is_bearing_hypothesis or not other.ai2_initialized)
+                    continue;   // no trustworthy aperture yet — punching a hole here would invent a sightline
+                const auto& os = other.model.state();
+                gaps.push_back({Eigen::Vector2f(os.ap_cx, os.ap_cy), 0.5f * os.w});
+            }
+            // Wall depth = the depth of material this aperture is cut through, i.e. the leaf's own fitted
+            // thickness. A derived physical quantity, not a new knob — and occlusion by a plane is insensitive
+            // to it anyway (a ray either crosses the plane or runs along it).
+            const auto walls = rc::nbv::wall_obstacles(fitter_->room_polygon(),
+                                                       std::max(1e-3f, inst.model.state().thickness), gaps);
+            obstacles.insert(obstacles.end(), walls.begin(), walls.end());
+        }
+        nbv_obstacle_count_ = static_cast<int>(obstacles.size());   // 0 walls ⇒ the room polygon never arrived
+
+        rc::nbv::Plan nbv_plan;
+        rc::EpistemicProposal prop =
+            epistemic_planner_.compute(inst.ai2_belief, cfg_.ai2_range_noise_lat_per_m, cfg_.ai2_sigma_base_m,
+                                       rc::nbv::sensor_from_graph(*G, inner_eigen_.get()), obstacles,
+                                       fitter_->room_polygon(), &nbv_plan);
+        log_nbv_decision(inst, nbv_plan, prop);   // logs REFUSED proposals too — keep it before the check
+        // Degenerate (non-finite) fit — retry next cycle.
+        if (not prop.valid or not prop.is_finite())
+            return std::nullopt;
+        if (orient)
+            prop.epistemic_target_yaw_rad = inst.hypothesis_azimuth;
+        return prop;
+    };
+
+    // Write attributes to the door node (read by legacy consumers)
+    hooks.record = [&](const rc::EpistemicProposal& published, float /*raw_gain*/)
+    { scene_graph_->write_epistemic_proposal(node, published); };
+
+    hooks.on_affordance_created = [this] { trigger_graph_layout_twopi(); };
+
+    rc::epistemic::step(inst, *G,
+                        {.cooldown_cycles = cfg_.epistemic_cooldown_cycles, .orient_mode = orient},
+                        hooks);
+}
+
+
+// ═══ THE THREE PRAGMATIC AFFORDANCES: approach / open / cross ════════════════════════════════════
+//
+// See door_pragmatics.h for the model and common/pragmatic_affordance for the protocol. What lives here
+// is the wiring: measure the preconditions, publish them on the door node so the contracts have
+// something to hold a predicate against, offer or withdraw each affordance, and — the one side effect
+// this agent has on the world — ask a provider to move the leaf when the consumer claims `open`.
+
+// What the agent believes about INTERACTING with one door, this cycle. Every field carries its own
+// `*_known`: "could not compute" is a different fact from "computed and it is false", and conflating
+// the two is how a standing offer gets withdrawn by a missing input.
+rc::door::InteractionState SpecificWorker::compute_interaction_state(const rc::DoorInstance& inst) const
+{
+    rc::door::InteractionState st;
+    const auto& pg = cfg_.pragmatic;
+    // A bearing-only hypothesis has no located aperture — there is nothing to approach, open or cross
+    // yet, only a direction to look in. That is the epistemic affordance's job, and it already has it.
+    if (not inst.ai2_initialized or inst.is_bearing_hypothesis)
+        return st;
+
+    const auto& ap = inst.aperture;
+    st.phi_rad       = inst.phi_est;
+    st.phi_known     = true;
+    st.clear_width_m = rc::door::clear_width(ap.w, inst.phi_est);
+
+    // ── P(passable) ──────────────────────────────────────────────────────────────────────────────
+    // MARGINALISED over the leaf-angle posterior, never read off its argmax: measured 2026-09-10 the
+    // phi support curve is nearly flat (peak 0.007–0.245), so its argmax is noise, and a parameter the
+    // data does not identify must not be allowed to decide whether an affordance exists.
+    const float needed = pg.robot_passage_width_m + pg.passage_margin_m;
+    if (const auto p = rc::door::passable_prob(inst.phi_curve, ap.w, needed); p.has_value())
+    {
+        st.p_open = *p;
+        st.p_open_known = true;
+        st.p_open_from_curve = true;
+    }
+    else if (pg.phi_sigma_rad > 0.0f and not inst.phi_from_command)
+    {
+        // ★NOT REACHED WHILE phi_est IS OUR OWN COMMAND. See DoorInstance::phi_from_command: with no
+        // curve AND an armed anticipation, marginalising over N(phi_est, sigma) would report the door
+        // wide open because we ASKED for it to be, satisfy the `open` contract's own completion
+        // predicate, and return Satisfied for a leaf that may not have moved. p_open_known then stays
+        // false, write_interaction_state publishes the neutral 0, and `open` can only complete on a real
+        // observation — or time out, which is the honest outcome when nobody ever saw the door open.
+        // ★NO CURVE THIS CYCLE IS THE NORMAL CASE AT THE MOMENT IT MATTERS, which is why this branch is
+        // not a fallback but part of the design. estimate_phi() clears phi_curve and refills it only from
+        // a fresh mask — and this agent's own config records that the ADE20K posterior over a plainly
+        // visible closed door collapses 0.995 → 0.048 as the robot CLOSES on it. So the door stops being
+        // segmented exactly when the robot is in the actuation zone: read off the curve alone, `open`
+        // would vanish at the only range from which it can be taken.
+        // What stands in is the BELIEF about the angle, which is maintained across cycles: phi_est is a
+        // rate-limited posterior mean carrying estimate_phi's own persistence prior. Its width is not
+        // tracked, so it is supplied (phi_sigma_rad) and the SAME passability question is asked under a
+        // discretised Gaussian about phi_est. Still a marginalisation, still no angle threshold — the
+        // difference from the branch above is only where the weights come from, and the published
+        // door_open_prob_from_curve flag says which so the two can never be confused in a log.
+        std::vector<std::pair<float, float>> prior_curve;
+        prior_curve.reserve(17);
+        for (int i = -8; i <= 8; ++i)
+        {
+            const float z   = 0.25f * static_cast<float>(i);            // ±2σ in quarter-σ steps
+            const float phi = std::clamp(inst.phi_est + z * pg.phi_sigma_rad,
+                                          0.0f, static_cast<float>(M_PI) * 0.5f);
+            prior_curve.emplace_back(phi, std::exp(-0.5f * z * z));
+        }
+        if (const auto p = rc::door::passable_prob(prior_curve, ap.w, needed); p.has_value())
+        {
+            st.p_open = *p;
+            st.p_open_known = true;
+            st.p_open_from_curve = false;
+        }
+    }
+
+    // ── P(the robot is in the actuation zone), and which SIDE it is on ───────────────────────────
+    if (not inner_eigen_)
+        return st;
+    const auto rtb = inner_eigen_->get_transformation_matrix("room", "body", 0);
+    if (not rtb.has_value())
+        return st;   // ALWAYS check the optional (CLAUDE.md); no pose ⇒ nothing below is knowable
+    const Eigen::Vector2f robot(static_cast<float>(rtb.value()(0, 3)),
+                                 static_cast<float>(rtb.value()(1, 3)));
+    const Eigen::Vector2f centre = ap.centre_xy();
+    const Eigen::Vector2f normal = ap.across_u();
+    const Eigen::Vector2f delta  = robot - centre;
+
+    st.robot_side    = normal.dot(delta);      // signed distance to the aperture PLANE
+    st.robot_range_m = delta.norm();
+
+    // σ of that range: the door's own along-wall uncertainty projected onto the radial direction, plus
+    // the robot↔door pose-chain uncertainty. The floor is what keeps this a probability rather than a
+    // step function — with σ == 0, P(d ≤ R) is exactly the distance threshold this design avoids.
+    const Eigen::Vector2f radial = st.robot_range_m > 1e-4f ? Eigen::Vector2f(delta / st.robot_range_m)
+                                                             : normal;
+    const float sigma_s  = std::sqrt(std::max(0.0f, inst.ai2_belief.covariance()(0, 0)));  // θ = [s,w,h]
+    const float var_door = std::pow(radial.dot(ap.wall_u) * sigma_s, 2.0f);
+    const float var_pose = radial.x() * radial.x() * inst.chain_cov_xx
+                         + radial.y() * radial.y() * inst.chain_cov_yy;
+    const float sigma    = std::sqrt(var_door
+                                     + std::max(var_pose, pg.pose_sigma_floor_m * pg.pose_sigma_floor_m));
+    // ★THE ACTUATION ZONE IS A BAND. Near edge = the leaf's own swept arc: a door hinged on the aperture
+    // edge reaches a full aperture-width out from the wall plane at 90 degrees, and since `LeafState::swing`
+    // is NEVER FITTED (door_fitter sets it from config and it stays there) we cannot claim it opens away
+    // from us. A robot inside that arc is struck by the door it just asked to be opened. Far edge = beyond
+    // it a request is not unambiguously about THIS door. Both edges are physical; the old disc modelled
+    // only the far one, so `open` stayed on offer right up against the leaf — failing toward the danger.
+    const float d_min = rc::door::safe_standoff(ap.w, pg);
+    const float d_max = std::max(pg.actuation_reach_m, d_min + 0.30f);   // a band, never empty
+    st.safe_standoff_m = d_min;
+    st.p_reach       = rc::door::prob_in_band(st.robot_range_m, d_min, d_max, sigma);
+    st.p_reach_known = true;
+    st.range_sigma_m = sigma;
+
+    // ── crossing progress, signed against the side latched when the claim was made ───────────────
+    // "Crossed" is a CHANGE of side, not a position, so it is only defined while a claim is outstanding.
+    // Outside one it stays 0 and unknown, and write_interaction_state publishes the neutral 0.
+    if (std::isfinite(inst.cross_side0))
+    {
+        const float sgn = inst.cross_side0 < 0.0f ? -1.0f : +1.0f;
+        st.crossing_progress = std::clamp(-sgn * st.robot_side
+                                          / std::max(1e-3f, pg.cross_clearance_m), -1.0f, 1.0f);
+        st.crossing_known = true;
+    }
+    return st;
+}
+
+void SpecificWorker::step_pragmatic_affordances(rc::DoorInstance& inst)
+{
+    if (not G or not scene_graph_)
+        return;
+    auto node_opt = G->get_node(inst.node_id);
+    if (not node_opt.has_value())
+        return;   // the door node is gone this cycle; del_node_slot will reset the affordances
+
+    const auto& pg = cfg_.pragmatic;
+    if (not inst.pragmatic_inited)
+    {
+        const rc::pragmatic::PragmaticAffordance::Policy pol{.offer_prob    = pg.offer_prob,
+                                                              .withdraw_prob = pg.withdraw_prob,
+                                                              .stable_cycles = pg.stable_cycles};
+        inst.aff_approach.init(G, inst.node_id, inst.node_name, "approach", pol);
+        inst.aff_open    .init(G, inst.node_id, inst.node_name, "open",     pol);
+        inst.aff_cross   .init(G, inst.node_id, inst.node_name, "cross",    pol);
+        inst.pragmatic_inited = true;
+    }
+
+    // Measure once, publish once, decide on exactly what was published. The dashboard, the log and the
+    // three offers therefore cannot disagree about which cycle they are describing.
+    inst.interaction = compute_interaction_state(inst);
+    const auto& st = inst.interaction;
+    scene_graph_->write_interaction_state(node_opt.value(), st);
+    G->update_node(node_opt.value());
+
+    // The public assertion about this doorway, decided on the SAME measurement the offers below use.
+    step_transitable_edge(inst, st);
+
+    const bool located = st.phi_known and st.p_reach_known;   // a real aperture AND a robot pose
+
+    // A node appearing or disappearing changes the graph's shape, so the viewer's layout has to be
+    // recomputed — the same reason the epistemic step has an on_affordance_created hook.
+    const bool had_any = inst.aff_approach.is_offered() or inst.aff_open.is_offered()
+                      or inst.aff_cross.is_offered();
+
+    // ── approach ─────────────────────────────────────────────────────────────────────────────────
+    // ★UNCONDITIONAL (p = 1) for a located door: a door can always be walked up to. What falls away as
+    // the robot arrives is its VALUE, not its availability — approaching a door you are already at is
+    // worth nothing, and saying so as a value rather than as a withdrawal is what stops the
+    // complete→re-offer→complete ping-pong a preconditioned version would produce at the doorway. Its
+    // completion predicate is door_reach_prob, which IS `open`'s precondition: "approach succeeded" and
+    // "open became possible" are one measurement, not two numbers that can drift apart.
+    {
+        rc::pragmatic::Offer o;
+        o.known = located;
+        o.p     = 1.0f;
+        // Stand in the MIDDLE of the actuation band: furthest from both failure modes (inside the leaf's
+        // arc on one side, too far to be about this door on the other) and so the most tolerant of the
+        // pose error that put us there. ★NOT ApproachStandoffM when that is inside the arc — a configured
+        // distance cannot know how wide this particular door is.
+        const float d_stand = 0.5f * (st.safe_standoff_m
+                                      + std::max(pg.actuation_reach_m, st.safe_standoff_m + 0.30f));
+        const auto pose = rc::door::front_pose(inst.aperture, st.robot_side, d_stand);
+        o.x_m = pose.x; o.y_m = pose.y; o.yaw_rad = pose.yaw;
+        o.value    = pg.value_approach * std::clamp(1.0f - st.p_reach, 0.0f, 1.0f);
+        o.contract = rc::door::approach_contract(pg);
+        o.why      = std::format("a located door can always be approached (P(reach)={:.2f} ⇒ value {:.3f})",
+                                 st.p_reach, o.value);
+        inst.aff_approach.update(o);
+    }
+
+    // ── open ─────────────────────────────────────────────────────────────────────────────────────
+    // Possible when the robot is believed to be IN the actuation zone AND the aperture is believed NOT
+    // passable. Both halves are needed: offering "open" from across the room is a request the consumer
+    // would have to chain by itself, and offering it for a door already standing open is asking for a
+    // no-op. The product is the joint probability under the two independent beliefs — no gate on either.
+    {
+        rc::pragmatic::Offer o;
+        o.known = located and st.p_open_known and not cfg_.door_control_endpoint.empty();
+        o.p     = st.p_reach * std::clamp(1.0f - st.p_open, 0.0f, 1.0f);
+        if (inst.actuation_refused)
+        {
+            // ★A REFUSAL IS INFORMATION, and this kind is permanent: UnknownDoor / NotActuable mean never
+            // ask again. Keeping the affordance on the wire would advertise an action that can only fail,
+            // and an impossible offer with a plausible price is worse than silence.
+            o.p   = 0.0f;
+            o.why = "the provider cannot actuate this door: " + inst.actuation_note;
+        }
+        else
+            o.why = std::format("P(in reach)={:.2f} × P(shut)={:.2f}{}", st.p_reach,
+                                 1.0f - st.p_open, st.p_open_from_curve ? "" : " (phi from the belief, no curve)");
+        const float d_stand = 0.5f * (st.safe_standoff_m
+                                      + std::max(pg.actuation_reach_m, st.safe_standoff_m + 0.30f));
+        const auto pose = rc::door::front_pose(inst.aperture, st.robot_side, d_stand);
+        // Orient policy: the (x,y) is informational — the consumer does not navigate, it turns to face
+        // the leaf and waits for the world to change. The YAW is the part that acts.
+        o.x_m = pose.x; o.y_m = pose.y; o.yaw_rad = pose.yaw;
+        o.value    = pg.value_open;
+        o.contract = rc::door::open_contract(pg);
+        inst.aff_open.update(o);
+    }
+
+    // ── cross ────────────────────────────────────────────────────────────────────────────────────
+    // Possible exactly while the aperture is believed passable for THIS robot's body. The target is on
+    // the far side and the heading carries the robot through; completion is the change of side.
+    {
+        rc::pragmatic::Offer o;
+        o.known = located and st.p_open_known;
+        o.p     = st.p_open;
+        const auto pose = rc::door::through_pose(inst.aperture, st.robot_side, pg.cross_standoff_m);
+        o.x_m = pose.x; o.y_m = pose.y; o.yaw_rad = pose.yaw;
+        o.value    = pg.value_cross;
+        o.contract = rc::door::cross_contract(pg);
+        o.why      = std::format("P(passable)={:.2f} — clear span {:.2f} m at phi={:.2f} rad vs {:.2f} m of body",
+                                 st.p_open, st.clear_width_m, st.phi_rad,
+                                 pg.robot_passage_width_m + pg.passage_margin_m);
+        inst.aff_cross.update(o);
+    }
+
+    if (const bool has_any = inst.aff_approach.is_offered() or inst.aff_open.is_offered()
+                          or inst.aff_cross.is_offered(); has_any != had_any)
+        trigger_graph_layout_twopi();
+
+    // ── the side effects of a claim ──────────────────────────────────────────────────────────────
+    // ★ONE-SHOTS, taken from the affordance rather than recomputed from the flags. `open` has a real
+    // effect in the world; firing it per cycle while the claim stands would queue a request per cycle.
+    if (inst.aff_open.consume_claim())
+    {
+        // ★PROTOCOL INVARIANT 2: ACT ON WHAT THE CONSUMER IS EXECUTING, NOT ON OUR LATEST PUBLICATION.
+        // We refresh the `open` pose every cycle while the offer stands, so by the time a claim lands the
+        // consumer may have accepted an earlier one — and asking a provider to swing a leaf is an act in
+        // the world, not a measurement to be retried. The claim carries the pose it is actually driving
+        // to after its own repairs; if that is a DIFFERENT proposal from the one now published
+        // (executing_epoch < epistemic_target_epoch) we do not know which doorway geometry the robot has
+        // committed to, and a door request built on the wrong one can open a different door. So: log it
+        // and wait for the consumer to adopt the current epoch, which it owns the decision to do.
+        if (inst.aff_open.claim_is_stale())
+        {
+            inst.actuation_note = "consumer accepted an older proposal; not asking until it catches up";
+            std::print("door_concept: [open] {} claimed on epoch {} while we publish {} — NOT sending a "
+                       "door request: we cannot tell which geometry the robot committed to\n",
+                       inst.node_name, inst.aff_open.claim().has_value() ? inst.aff_open.claim()->epoch : -1,
+                       inst.aff_open.epoch());
+        }
+        else if (not pg.autonomous_actuation)
+        {
+            inst.actuation_note = "autonomous actuation is disabled (DoorAffordance.AutonomousActuation)";
+            std::print("door_concept: [open] {} was CLAIMED but autonomous actuation is off — "
+                       "the request must come from the strip button\n", inst.node_name);
+        }
+        else
+        {
+            std::string why;
+            if (request_door_actuation(inst, /*open=*/true, pg.actuation_provider_id,
+                                        "robot needs to pass through", why))
+                std::print("door_concept: [open] {} claimed → asked the provider to OPEN it "
+                           "(request {} of this run)\n", inst.node_name, inst.actuation_requests);
+            else
+            {
+                inst.actuation_note = why;
+                std::print("door_concept: [open] {} claimed but the request was refused LOCALLY: {}\n",
+                           inst.node_name, why);
+            }
+        }
+    }
+    if (inst.aff_open.consume_completion())
+        std::print("door_concept: [open] {} finished, outcome = {} (P(passable) is now {:.2f}{})\n",
+                   inst.node_name, rc::affordance::to_string(inst.aff_open.outcome()),
+                   st.p_open, st.p_open_known ? "" : ", unmeasured");
+
+    if (inst.aff_cross.consume_claim())
+    {
+        // ★LATCH THE SIDE, ONCE, HERE. door_crossing_progress is signed against it, so re-latching per
+        // cycle would make the measure its own input and read 0 for ever — the crossing could never
+        // complete and the contract would always time out.
+        //
+        // ★AND LATCH IT AGAINST THE CONSUMER'S OWN TARGET WHERE WE HAVE IT (protocol invariant 2: the
+        // producer measures progress against executing_target_*, NEVER against its own latest
+        // publication). The through-pose we published says which side we EXPECT the robot to end up on;
+        // the claim says which side it is actually driving to, after its own repairs. If the consumer
+        // repaired our target to the opposite side of the aperture — which it may legitimately do when
+        // ours is unreachable — then progress signed against our expectation would count the crossing
+        // backwards and the contract could only ever time out. With no edge (a pre-rollout consumer) we
+        // fall back to the robot's measured side, which is what this did before.
+        inst.cross_side0 = st.robot_side;
+        if (const auto& c = inst.aff_cross.claim(); c.has_value())
+        {
+            const Eigen::Vector2f n = inst.aperture.across_u();
+            const Eigen::Vector2f centre = inst.aperture.centre_xy();
+            const float target_side = n.dot(Eigen::Vector2f(c->x, c->y) - centre);
+            // The robot must END on the far side of the plane from where it starts. If the consumer's
+            // committed target is on the SAME side as the robot, this claim is not a crossing at all.
+            if (target_side * st.robot_side > 0.0f)
+                std::print("door_concept: [cross] ⚠{} claimed, but the consumer is driving to "
+                           "({:.2f},{:.2f}), which is on the robot's OWN side of the aperture "
+                           "(side {:+.2f} vs robot {:+.2f}) — this claim cannot complete as a crossing\n",
+                           inst.node_name, c->x, c->y, target_side, st.robot_side);
+        }
+        std::print("door_concept: [cross] {} claimed from side {:+.2f} m — through-pose ({:.2f},{:.2f})\n",
+                   inst.node_name, inst.cross_side0,
+                   rc::door::through_pose(inst.aperture, st.robot_side, pg.cross_standoff_m).x,
+                   rc::door::through_pose(inst.aperture, st.robot_side, pg.cross_standoff_m).y);
+    }
+    if (inst.aff_cross.consume_completion())
+    {
+        std::print("door_concept: [cross] {} finished, outcome = {} (progress {:+.2f})\n",
+                   inst.node_name, rc::affordance::to_string(inst.aff_cross.outcome()),
+                   st.crossing_progress);
+        inst.cross_side0 = std::numeric_limits<float>::quiet_NaN();
+    }
+    if (inst.aff_approach.consume_completion())
+        std::print("door_concept: [approach] {} finished, outcome = {} (P(reach)={:.2f})\n",
+                   inst.node_name, rc::affordance::to_string(inst.aff_approach.outcome()), st.p_reach);
+}
+
+// ─── ONE request path: ask a provider to move a door ─────────────────────────────────────────────
+//
+// Called by the strip buttons AND by the `open` affordance when the consumer claims it. Everything that
+// can go wrong about frames, identity and anticipation is decided here, once.
+//
+// ★NOTHING IN HERE EVER CONCLUDES THAT A DOOR IS OPEN. `Delivered` means the provider did what it was
+// asked, not that the world changed; that stays a perceptual question, answered by door_open_prob from
+// the image. Wiring a protocol event into a belief is the mistake the affordance work spent a month
+// removing.
+bool SpecificWorker::request_door_actuation(rc::DoorInstance& inst, bool open,
+                                             const std::string& provider_id,
+                                             const std::string& purpose, std::string& why)
+{
+    why.clear();
+    if (cfg_.door_control_endpoint.empty())
+    { why = "no DoorControl endpoint configured"; return false; }
+
+    // ★THE APERTURE, NOT THE LEAF. What a provider is asked to move is identified by the DOORWAY — the
+    // static hole in the wall — and the leaf is the part that moves. At phi == 0 the two coincide
+    // exactly, so this is identical to the previous behaviour today, and it stops the quoted pose
+    // wandering by w/2 the moment a leaf actually swings, which is precisely when we ask again.
+    const auto& ap        = inst.aperture;
+    const Eigen::Vector2f xy = ap.centre_xy();
+    const float yaw       = ap.yaw();
+    const float width_m   = ap.w;
+
+    // world←room. ★THE FRAME IS CALLED `root` HERE, not `world`: asking for "world" returned nullopt,
+    // the old code fell back to identity, and ROOM coordinates went out labelled as world — 4 m from the
+    // provider's own door, which it correctly answered UnknownDoor to. That reads as a broken interface
+    // rather than a frame-name typo.
+    // ★PREFER THE LEARNED REGISTRATION over root←room. Measured on the door_3 ↔ DOOR_1 correspondence the
+    // DSR root is NOT the provider's world frame — they are 6.45 m apart and rotated ~90.3°, so root←room
+    // resolves fine and is simply the wrong transform. It is kept as a fallback for a deployment where
+    // the two ARE the same frame.
+    Eigen::Matrix4d world_T_room = Eigen::Matrix4d::Identity();
+    bool have_tf = false;
+    if (const auto reg = door_registration_.world_T_room(); reg.has_value())
+    { world_T_room = *reg; have_tf = true; }
+    else if (inner_eigen_)
+        for (const char* frame : {"root", "world"})
+            if (const auto m = inner_eigen_->get_transformation_matrix(frame, "room", 0); m.has_value())
+            { world_T_room = m.value().matrix(); have_tf = true; break; }
+
+    // ★REFUSE LOCALLY rather than send coordinates we know are wrong. Only the PLACE path needs the
+    // transform: with an explicit provider id the pose is informational and a missing transform is not a
+    // reason to refuse. Without one, a request built on a missing transform can only be rejected — or,
+    // far worse, match SOME OTHER door within the provider's 400 mm radius and open that instead.
+    // Not asking is the safe failure, and it says why.
+    const bool by_place = provider_id.empty();
+    if (by_place and not have_tf)
+    {
+        why = "matching by place needs a root←room transform, which does not resolve — "
+              "name a provider door id (DoorAffordance.ActuationProviderId, or the strip picker)";
+        return false;
+    }
+
+    door_pending_ = door_actuator_.request(inst.node_name, xy, yaw, width_m, open, world_T_room,
+                                            purpose, provider_id);
+    if (not door_pending_.has_value())
+    { why = "no provider"; return false; }
+    ++inst.actuation_requests;
+    inst.actuation_note = door_pending_->state;
+
+    // ★A REFUSAL IS INFORMATION, AND THE KINDS DIFFER (door_actuator.h). UnknownDoor / NotActuable mean
+    // never ask again, and the `open` affordance reads this to stop offering an action that can only
+    // fail. TemporarilyBusy and Declined are NOT latched: "later" and "a person said no this time" are
+    // different beliefs from "this door cannot be actuated", and collapsing them into one would retire a
+    // perfectly good affordance on a transient.
+    if (door_pending_->settled)
+    {
+        const auto& st = door_pending_->state;
+        if (st.find("UnknownDoor") != std::string::npos or st.find("NotActuable") != std::string::npos)
+        {
+            inst.actuation_refused = true;
+            std::print("door_concept: [actuator] {} is NOT ACTUABLE by this provider ({}) — "
+                       "the `open` affordance will stop being offered for it\n", inst.node_name, st);
+        }
+    }
+
+    // ★A SUCCESSFUL BY-NAME REQUEST IS A LABELLED CORRESPONDENCE, and it is free. The operator has just
+    // asserted "the door I believe here is the one you call DOOR_1" — a pair of poses in the two frames,
+    // produced as a side effect of pressing a button. Two such pairs pin the rigid transform outright,
+    // which is what makes the autonomous (by place) path possible at all: a robot deciding on its own to
+    // open a door has nobody to pick a name from a list.
+    if (not provider_id.empty() and not door_pending_->settled)
+        for (const auto& d : door_actuator_.caps().doors)
+            if (d.id == provider_id)
+            {
+                // The pair carries BOTH yaws, so a one-pair fit can recover rotation and the result is
+                // identical after a restart instead of silently assuming none.
+                door_registration_.add({xy, d.xy_mm / 1000.0f, inst.node_name, d.id, yaw, d.angle},
+                                       "etc/door_world_registration.csv");
+                const auto& f = door_registration_.solve();
+                std::println("door_concept: [registration] {} pair(s) -> theta {:+.3f} rad "
+                             "t ({:+.3f}, {:+.3f}) m, residual {:.3f} m{}",
+                             f.n_pairs, f.theta, f.t.x(), f.t.y(), f.residual_m,
+                             f.provisional ? "  ⚠PROVISIONAL (one pair: rotation from yaws)" : "");
+                break;
+            }
+
+    // ★ARM THE ANTICIPATION. The request just issued is a prediction about the world: from now until the
+    // swing completes, the leaf angle is a known function of time. Handing that to the estimator is what
+    // stops the agent being surprised by its own action — with phi pinned, the predicted silhouette
+    // stayed in the doorway the leaf had just left, all 420 samples went dark, and the existence channel
+    // deleted the door BECAUSE it obeyed. The command enters as a PRIOR on phi, never as a licence to
+    // suppress evidence: the estimate is still scored against the image every cycle and can refute it.
+    if (not door_pending_->settled)
+    {
+        inst.phi_cmd_from   = inst.phi_est;
+        inst.phi_cmd_to     = open ? static_cast<float>(M_PI) / 2.0f : 0.0f;
+        inst.phi_cmd_rate   = cfg_.pragmatic.actuation_swing_rate;   // MUST match the bridge; see the config
+        inst.phi_cmd_t0     = std::chrono::steady_clock::now();
+        inst.phi_cmd_active = true;
+        std::println("door_concept: [phi] anticipating {} swing {:.2f} -> {:.2f} rad at {:.2f} rad/s",
+                     inst.node_name, inst.phi_cmd_from, inst.phi_cmd_to, inst.phi_cmd_rate);
+    }
+    return true;
+}
+
+
+// ═══ WHICH ROOM ARE WE IN — follow `current`, and let go of the room we leave ════════════════════
+
+std::optional<std::uint64_t> SpecificWorker::resolve_current_room() const
+{
+    if (not G) return std::nullopt;
+    // `current` is ltsm_agent's ONE output into the live graph: robot --[current]--> room. Read it by
+    // EDGE TYPE rather than by walking from a robot node we would have to identify by name — the robot
+    // node is "Shadow" on one platform and something else on the next, and a name is a second source of
+    // truth that drifts. The destination's TYPE is the check that matters.
+    std::optional<std::uint64_t> found;
+    int n_room_edges = 0;
+    for (const auto& e : G->get_edges_by_type("current"))
+    {
+        const auto dst = G->get_node(e.to());
+        if (not dst.has_value() or dst.value().type() != "room")
+            continue;                       // a `current` edge to something that is not a room is not ours to read
+        ++n_room_edges;
+        found = e.to();
+    }
+    // ★TWO `current` EDGES IS AMBIGUOUS, AND GUESSING IS WORSE THAN WAITING. It would mean the owner is
+    // mid-write or two writers exist; either way picking one at random could let go of a room we are
+    // still in. Report nothing, which the caller treats as "no information", not as a release.
+    if (n_room_edges > 1)
+    {
+        static int warned = 0;
+        if (warned++ % 120 == 0)
+            std::print("door_concept: [room] {} `current` edges point at rooms — ambiguous, not following "
+                       "any of them until exactly one remains\n", n_room_edges);
+        return std::nullopt;
+    }
+    return found;
+}
+
+void SpecificWorker::step_room_following()
+{
+    if (not G) return;
+    const auto current = resolve_current_room();
+
+    // ★ABSENCE OF A `current` EDGE IS NOT A RELEASE, and this is the whole backward-compatibility
+    // contract. Nothing in today's fleet publishes that edge, so `current` is nullopt everywhere and this
+    // function must behave exactly as the old latch did — otherwise shipping it would make every agent
+    // let go of every room on the first cycle. "Nobody has told me where I am" and "I have been told I am
+    // somewhere else" are different facts and only the second one releases anything.
+    if (not current.has_value())
+    {
+        if (room_node_id_ == 0)                       // the legacy first-resolution path, unchanged
+        {
+            const auto rooms = G->get_nodes_by_type("room");
+            if (not rooms.empty())
+                room_node_id_ = rooms.front().id();
+        }
+        return;
+    }
+
+    if (room_node_id_ == *current)
+        return;                                        // already following it; the common case
+
+    if (room_node_id_ == 0)
+    {
+        room_node_id_ = *current;
+        std::print("door_concept: [room] following `current` → room node {}\n", room_node_id_);
+        return;
+    }
+
+    // We are anchored to one room and told we are in another. LET GO.
+    release_room(room_node_id_, *current);
+}
+
+void SpecificWorker::release_room(std::uint64_t old_room, std::uint64_t new_room)
+{
+    std::print("door_concept: [room] LET GO — `current` moved {} → {}. Releasing {} door(s) that belong "
+               "to the room we have left; the new room's doors will be re-earned from scratch.\n",
+               old_room, new_room, fitter_ ? fitter_->instances().size() : 0u);
+
+    // Our own nodes, through our own teardown path — which drops the epistemic affordance AND the three
+    // pragmatic ones, then the door node (whose RT edge goes with it). Collected first: retire_instance
+    // erases from the map we would otherwise be iterating.
+    if (fitter_)
+    {
+        std::vector<std::uint64_t> leaving;
+        leaving.reserve(fitter_->instances().size());
+        for (const auto& [id, inst] : fitter_->instances())
+        {
+            leaving.push_back(id);
+            // ★A door being released is NOT a door that stopped existing. Log it as a release so the
+            // phantom/death record is not polluted with removals that carry no evidence about the world:
+            // the existence belief that justified this door is still perfectly valid, we are simply no
+            // longer the agent looking at that room.
+            log_tracker_event("RELEASE", id, inst.model.state().cx, inst.model.state().cy,
+                              std::format("room {} -> {}", old_room, new_room));
+        }
+        for (const auto id : leaving)
+            retire_instance(id);
+    }
+
+    // ★GHOSTS ARE ROOM-LOCAL AND MUST NOT CROSS. A ghost is "a door was removed at this (x,y), let it
+    // take its old name if it comes back there" — in ROOM coordinates. Carried into a different room's
+    // frame, the same (x,y) is a different physical place, and the first door detected near it would
+    // silently inherit another room's identity.
+    ghosts_.clear();
+
+    // ⚠KNOWN GAP, STATED RATHER THAN PAPERED OVER: etc/door_identities.csv maps name ↔ APERTURE PLACE
+    // and has NO room key. Two rooms have their own origins, so a door at the same coordinates in each
+    // is indistinguishable in that table, and cross-room identity is therefore NOT supported yet. We
+    // deliberately do NOT write the released room's doors into it here (that would actively create the
+    // collision), and we do not clear the on-disk table (a restart in the old room still recovers).
+    // ltsm_agent's passage node is the right long-term home for a doorway's identity across rooms.
+    if (not identities_.empty())
+        std::print("door_concept: [identity] ⚠the identity table is not room-keyed ({} entries); "
+                   "door names are NOT carried across a room change\n", identities_.size());
+
+    room_node_id_ = new_room;
+    // ★DROP THE OLD POLYGON BEFORE PICKING UP THE NEW ONE. The containment prior is the path that can
+    // remove a door without any sensor evidence, so a single cycle evaluated against the walls of the
+    // room we have just left is a cycle in which every door in the new room is "outside the room".
+    // Emptying it first makes has_room_polygon() false, which disables the prior rather than running it
+    // on the wrong walls — the fail-safe direction.
+    fitter_->set_room_geometry(Eigen::Vector2f::Zero(), {});
+    refresh_room_geometry();         // and pick the new one up in the same cycle
+}
+
+
+// Put the door on the 2-D graph canvas NEXT TO ITS ACTUAL RT PARENT, and keep it there when the parent
+// changes. ★The canvas is a picture of the structure, so it must be anchored to the same node the
+// structure is: this used to place every door relative to the ROOM while the RT edge came from a WALL,
+// which drew the door floating beside the room with its single edge disappearing off-screen toward a
+// wall somewhere else in the layout. It reads as "the door is not connected to the room" — and the only
+// way to find out otherwise is to trace the RT chain by hand, which nobody should have to do to trust a
+// diagram. No-op unless the anchor actually changed, so it costs one attribute read per cycle.
+void SpecificWorker::place_door_on_canvas(const DSR::Node& node, rc::DoorInstance& inst)
+{
+    if (not G) return;
+    // The RT parent, as the graph states it — not as we remember it.
+    std::uint64_t anchor = 0;
+    for (const auto& e : G->get_edges_to_id(node.id()))
+        if (e.type() == "RT") { anchor = e.from(); break; }
+    if (anchor == 0)
+        anchor = room_node_id_;            // pre-wall: a door is born hanging from the room
+    if (anchor == 0 or anchor == inst.canvas_anchor_id)
+        return;
+
+    float px = 200.f, py = 200.f;
+    if (const auto an = G->get_node(anchor); an.has_value())
+    {
+        px = G->get_attrib_by_name<pos_x_att>(an.value()).value_or(200.f);
+        py = G->get_attrib_by_name<pos_y_att>(an.value()).value_or(200.f);
+    }
+    auto n_mut = node;
+    G->add_or_modify_attrib_local<pos_x_att>(n_mut, px + 90.f);
+    G->add_or_modify_attrib_local<pos_y_att>(n_mut, py + 60.f);
+    G->update_node(n_mut);
+    inst.canvas_anchor_id = anchor;
+    trigger_graph_layout_twopi();
+}
+
+
+// ─── door --[transitable]--> door ────────────────────────────────────────────────────────────────
+//
+// A SELF-EDGE on the door's own node, present exactly while this agent believes the robot can get
+// through. It exists so a consumer can ask the GRAPH whether a doorway is passable instead of fetching
+// the door's geometry, the leaf angle and the robot's own width and re-deriving the answer — which is
+// three transforms and a model each, and three chances to derive it differently from us.
+//
+// ★WHY A SELF-EDGE AND NOT AN ATTRIBUTE. An attribute would ride on `update_node`, which is a WHOLE-NODE
+// REPLACE on both sync engines: any writer refreshing this node from a stale copy silently reverts — or
+// destroys — a flag another writer had just set. That is the same reasoning that put the affordance
+// protocol's execution claim on an edge rather than on the affordance node, and it applies here for the
+// same mechanical reason. An edge is its own object with its own key, so asserting and retracting it
+// cannot race the door's per-cycle geometry republish.
+//
+// ★"transitable", NOT "open". The belief is P(clear span >= THIS ROBOT'S passage width), so the edge says
+// "this body fits", not "the leaf has moved". A door ajar by 20 cm is open and not transitable. Naming it
+// after the quantity actually computed is what stops a consumer reading it as a claim about the mechanism.
+//
+// ★UNMEASURED HOLDS. p_open_known == false means nothing measured the aperture this cycle — a different
+// fact from "measured, and it is shut", and the two must not share a code path. Neither streak advances
+// and the edge is left exactly as it is. Today's sentinel work is the same lesson from the other end:
+// door_open_prob publishes -1 for NOT MEASURED precisely because 0 is a real answer ("believed shut"),
+// and an absence encoded as a legitimate value is indistinguishable from that value.
+void SpecificWorker::step_transitable_edge(rc::DoorInstance& inst, const rc::door::InteractionState& st)
+{
+    if (not G)
+        return;
+    const auto& pg = cfg_.pragmatic;
+
+    // HOLD on an unmeasured cycle — see the header comment. Not a gate on the belief: a gate on whether
+    // there IS one this cycle.
+    if (not st.p_open_known)
+        return;
+
+    const bool yes = st.p_open >= pg.transitable_prob;
+    const bool no  = st.p_open <  pg.not_transitable_prob;
+    // Inside the Schmitt band NEITHER streak grows, so a probability hovering at the boundary holds
+    // whatever was last decided rather than flapping a public edge at the compute rate.
+    inst.transitable_streak     = yes ? inst.transitable_streak + 1 : 0;
+    inst.not_transitable_streak = no  ? inst.not_transitable_streak + 1 : 0;
+
+    if (not inst.transitable_asserted and inst.transitable_streak >= pg.transitable_stable_cycles)
+    {
+        auto edge = DSR::Edge::create<transitable_edge_type>(inst.node_id, inst.node_id);
+        if (G->insert_or_assign_edge(edge))
+        {
+            inst.transitable_asserted = true;
+            std::print("door_concept: [transitable] {} ASSERTED — P(passable)={:.3f} held {} measured "
+                       "cycles (clear span {:.2f} m at phi={:.1f} deg vs {:.2f} m of body)\n",
+                       inst.node_name, st.p_open, inst.transitable_streak, st.clear_width_m,
+                       st.phi_rad * 180.0f / static_cast<float>(M_PI),
+                       pg.robot_passage_width_m + pg.passage_margin_m);
+        }
+        else
+            std::print("door_concept: [transitable] {} could NOT assert the edge (node {} missing?)\n",
+                       inst.node_name, inst.node_id);
+    }
+    else if (inst.transitable_asserted and inst.not_transitable_streak >= pg.transitable_stable_cycles)
+    {
+        G->delete_edge(inst.node_id, inst.node_id, "transitable");
+        inst.transitable_asserted = false;
+        std::print("door_concept: [transitable] {} RETRACTED — P(passable)={:.3f} held {} measured "
+                   "cycles below {:.2f} (clear span {:.2f} m at phi={:.1f} deg)\n",
+                   inst.node_name, st.p_open, inst.not_transitable_streak, pg.not_transitable_prob,
+                   st.clear_width_m, st.phi_rad * 180.0f / static_cast<float>(M_PI));
+    }
+}
+
+// ─── DSR helpers ─────────────────────────────────────────────────────────────
+
+
+void SpecificWorker::trigger_graph_layout_twopi()
+{
+    // SHARED (common/graph_layout) — pure viewer plumbing. See the header for why the layout runs twice.
+    rc::gui::trigger_layout_twopi(graph_viewers);
+}
+// ─── DSR signal slots ────────────────────────────────────────────────────────
+
+void SpecificWorker::modify_node_slot(std::uint64_t id, const std::string& type)
+{
+    // Doors are generic `object` nodes named "door_*" (schema migration).
+    if (type != "object")
+        return;
+
+    const auto node_opt = G->get_node(id);
+    if (not node_opt.has_value())
+        return;
+    if (not node_opt.value().name().starts_with("door"))
+        return;
+
+    fitter_->ensure_instance(node_opt.value(), room_node_id_);
+}
+
+// Poll the controller-owned protocol flags once per cycle. This REPLACES the update_node_attr_signal
+// subscription (see the connect block in initialize() for the starvation it caused). Both things it did are
+// pure reads of the CURRENT graph state, so polling gives the same answer — a controller claim or completion
+// simply lands on the next cycle instead of within the emitting DDS callback.
+//
+// Cost is bounded by OUR instance count (typically 1–3), not by the graph's global write rate, which is the
+// whole point: the old path did work proportional to what every other agent was writing.
+void SpecificWorker::poll_affordance_protocol()
+{
+    if (not fitter_ or not G)
+        return;   // may be called before the fit core exists — the guard every graph reader here needs
+    // SHARED (common/object_affordance): see rc::poll_protocol for why this is POLLED and not driven by
+    // update_node_attr_signal, and for what happened to the one agent that had neither.
+    rc::poll_protocol(fitter_->instances(), *G);
+}
+void SpecificWorker::del_node_slot(std::uint64_t id)
+{
+    // Notify affordance in case its own DSR node was deleted externally
+    for (auto& [door_id, inst] : fitter_->instances())
+    {
+        if (inst.affordance.node_id() == id)
+            inst.affordance.on_node_deleted(id);
+        // The three pragmatic siblings, same reason: a node deleted by anybody else (the startup sweep,
+        // an operator, the LTSM let-go rule) must leave this agent believing it is absent, or update()
+        // keeps refreshing an id that is gone and the affordance is never re-offered.
+        inst.aff_approach.on_node_deleted(id);
+        inst.aff_open.on_node_deleted(id);
+        inst.aff_cross.on_node_deleted(id);
+    }
+
+    if (fitter_->instances().count(id))
+    {
+        std::print("door_concept: node {} removed from DSR, destroying instance\n", id);
+        fitter_->instances().erase(id);
+    }
+}
+
+// ─── Lifecycle stubs ─────────────────────────────────────────────────────────
+
+void SpecificWorker::emergency()
+{
+    std::print("door_concept: emergency()\n");
+}
+
+void SpecificWorker::restore()
+{
+    std::print("door_concept: restore()\n");
+}
+
+int SpecificWorker::startup_check()
+{
+    std::print("door_concept: startup_check()\n");
+    return 0;
+}
+
+
+
+

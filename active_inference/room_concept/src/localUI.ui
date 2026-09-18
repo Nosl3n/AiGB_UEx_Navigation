@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>local_guiDlg</class>
+ <widget class="QWidget" name="local_guiDlg">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>700</width>
+    <height>430</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string> layout</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <item>
+    <layout class="QHBoxLayout" name="controlsLayout">
+     <item>
+      <widget class="QPushButton" name="btn_camera_viz">
+       <property name="text">
+        <string>ZED</string>
+       </property>
+       <property name="maximumHeight">
+        <number>35</number>
+       </property>
+      </widget>
+     </item>
+<item>
+      <widget class="QPushButton" name="btn_ricoh_viz">
+       <property name="text">
+        <string>Ricoh</string>
+       </property>
+       <property name="maximumHeight">
+        <number>35</number>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="btn_lidar_points_viz">
+       <property name="text">
+        <string>Lidar</string>
+       </property>
+       <property name="checkable">
+        <bool>true</bool>
+       </property>
+       <property name="checked">
+        <bool>false</bool>
+       </property>
+       <property name="maximumHeight">
+        <number>35</number>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="btn_calib_viz">
+       <property name="text">
+        <string>Calib</string>
+       </property>
+       <property name="toolTip">
+        <string>Self-calibration: parameter values, their uncertainty, and whether the driving is currently teaching each one</string>
+       </property>
+       <property name="maximumHeight">
+        <number>35</number>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="lbl_room_stable">
+       <property name="text">
+        <string>ROOM ?</string>
+       </property>
+       <property name="alignment">
+        <set>Qt::AlignCenter</set>
+       </property>
+       <property name="minimumWidth">
+        <number>150</number>
+       </property>
+       <property name="minimumHeight">
+        <number>35</number>
+       </property>
+       <property name="maximumHeight">
+        <number>35</number>
+       </property>
+       <property name="toolTip">
+        <string>Room stabilization state: red until localization is stable enough to create the room node, green once the room exists in the DSR graph.</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <spacer name="controlsSpacer">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QSplitter" name="splitter">
+     <property name="orientation">
+      <enum>Qt::Horizontal</enum>
+     </property>
+     <widget class="QFrame" name="frame">
+      <property name="frameShape">
+       <enum>QFrame::StyledPanel</enum>
+      </property>
+      <property name="frameShadow">
+       <enum>QFrame::Raised</enum>
+      </property>
+     </widget>
+     <widget class="QFrame" name="frame_series">
+      <property name="frameShape">
+       <enum>QFrame::StyledPanel</enum>
+      </property>
+      <property name="frameShadow">
+       <enum>QFrame::Raised</enum>
+      </property>
+     </widget>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

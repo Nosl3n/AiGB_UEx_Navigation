@@ -1,0 +1,11 @@
+# the run constants an offline replay needs (arm 7). Written when the pair CSV opens.
+robot,Shadow
+camera,zed
+cam_kind,0
+cam_intrinsics,448,448,640,360,1280,720,1,0
+cam_R_robot,1,-0.000972525,0,0.000972524,0.999999,0.00118205,-1.14957e-06,-0.00118205,0.999999
+cam_t_robot,-7.29394e-05,0.0738445,-0.980003
+prior_sigmas,0.0035,0.01,0.0035
+offset_sigma_px,5.3
+applied,-0.00118205,-0.0024155,0.000972525
+lidar_t_robot,0,-0.155,1.1075

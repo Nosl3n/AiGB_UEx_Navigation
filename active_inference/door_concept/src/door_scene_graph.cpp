@@ -1,0 +1,473 @@
+/*
+ * door_scene_graph.cpp — DSR node/RT I/O for door_concept.
+ */
+
+#include "door_scene_graph.h"
+
+#include "../../common/rt_covariance/rt_covariance.h"   // rc::rtcov::publish (SHARED)
+
+#include <algorithm>
+#include <charconv>
+#include <cmath>
+#include <limits>
+#include <optional>
+#include <print>
+#include <utility>
+
+#include <QDebug>
+
+#include "door_model.h"   // rc::DoorModel statics (TOP_THICKNESS, LEG_RADIUS)
+#include "../../common/graph_provenance/creation_stamp.h"   // rc::provenance::stamp_creation
+
+namespace rc {
+
+DoorSceneGraph::DoorSceneGraph(std::shared_ptr<DSR::DSRGraph> graph,
+                                 DSR::RT_API* rt_api,
+                                 const DoorConfig& cfg,
+                                 std::function<void()> relayout)
+    : G_(std::move(graph)), rt_api_(rt_api), cfg_(cfg), relayout_(std::move(relayout))
+{}
+
+namespace
+{
+// Door pose (room frame: centre cx,cy; base on the floor z=0; heading yaw_room) expressed in the wall
+// node's local frame (origin = wall midpoint at height z0, x = wall tangent yaw_w). Returns the RT-edge
+// translation (along-wall, across-wall, base-below-origin) + the door's yaw relative to the wall.
+struct LocalPose { float x, y, z, yaw; };
+LocalPose door_in_wall(float cx, float cy, float yaw_room,
+                       const Eigen::Vector2f& mid, float yaw_w, float z0)
+{
+    const float c = std::cos(yaw_w), s = std::sin(yaw_w);
+    const float rx = cx - mid.x(), ry = cy - mid.y();
+    const float lyaw = std::remainder(yaw_room - yaw_w, 2.0f * static_cast<float>(M_PI));
+    return { c * rx + s * ry, -s * rx + c * ry, 0.0f - z0, lyaw };
+}
+}  // namespace
+
+// Pick the "wall_*" node whose segment is nearest the door centre. Each wall node carries an RT edge from
+// its parent (midpoint + tangent yaw) and width_m (length); we clamp-project the door centre onto every
+// wall segment and keep the closest. ok=false ⇒ no wall nodes yet (room_concept not up) → caller hangs from room.
+//
+// ★ The parent is read off the wall, NOT assumed to be the room. room_concept now hangs its walls from a
+//   "floor" node, and hard-coding get_edge(room_id, ...) made every wall unresolvable overnight — silently,
+//   because "no wall nodes yet" and "the edge moved" arrive here as the same empty optional. The midpoint
+//   still reads in ROOM coordinates: floor→room is the identity RT, which is the whole point of that node.
+DoorSceneGraph::WallRef DoorSceneGraph::resolve_wall(std::uint64_t room_id, const Eigen::Vector2f& door_xy) const
+{
+    WallRef best;
+    float best_d2 = std::numeric_limits<float>::max();
+    for (const auto& wn : G_->get_nodes_by_type("wall"))
+    {
+        const auto parent_id = G_->get_attrib_by_name<parent_att>(wn).value_or(room_id);
+        auto edge = G_->get_edge(parent_id, wn.id(), "RT");
+        if (not edge.has_value() and parent_id != room_id)
+            edge = G_->get_edge(room_id, wn.id(), "RT");   // pre-floor graphs
+        if (not edge.has_value()) continue;
+        const auto tr  = G_->get_attrib_by_name<rt_translation_att>(edge.value());
+        const auto rot = G_->get_attrib_by_name<rt_rotation_euler_xyz_att>(edge.value());
+        if (not tr.has_value() or not rot.has_value()) continue;
+        const auto& t = tr.value().get();
+        const auto& r = rot.value().get();
+        if (t.size() < 3 or r.size() < 3) continue;
+        const Eigen::Vector2f mid(t[0], t[1]);
+        const float yaw = r[2];
+        float L = 1.0f;
+        if (const auto w = G_->get_attrib_by_name<width_m_att>(wn); w.has_value()) L = w.value();
+        const Eigen::Vector2f dir(std::cos(yaw), std::sin(yaw));
+        const float proj = std::clamp((door_xy - mid).dot(dir), -0.5f * L, 0.5f * L);
+        const float d2 = (door_xy - (mid + proj * dir)).squaredNorm();
+        if (d2 < best_d2)
+        {
+            best_d2 = d2;
+            best = WallRef{wn.id(), mid, yaw, t[2], L, true};
+        }
+    }
+    return best;
+}
+
+std::uint64_t DoorSceneGraph::create_instance_from_detection(const Eigen::Vector3f& centroid_room,
+                                                              std::uint64_t room_node_id,
+                                                              std::string_view preferred_name,
+                                                              std::span<const std::string> reserved_names)
+{
+    auto room_opt = G_->get_node(room_node_id);
+    if (not room_opt.has_value())
+        return 0;
+
+    // Auto-name: one past the highest "door_<N>" that is LIVE OR REMEMBERED. Doors are now generic `object`
+    // nodes named "door_*" (schema migration), so scan get_nodes_by_type("object") + name-prefix filter.
+    int max_n = 0;
+    const auto bump = [&](std::string_view nm)
+    {
+        if (not nm.starts_with("door_")) return;
+        int v = 0;
+        const std::string_view digits = nm.substr(5);   // "door_" = 5 chars
+        if (std::from_chars(digits.data(), digits.data() + digits.size(), v).ec == std::errc{})
+            max_n = std::max(max_n, v);
+    };
+    bool preferred_free = not preferred_name.empty();
+    for (const auto& n : G_->get_nodes_by_type("object"))
+        if (n.name().rfind("door_", 0) == 0)
+        {
+            if (n.name() == preferred_name) preferred_free = false;   // still occupied → don't collide
+            bump(n.name());
+        }
+    // A number a GHOST still holds is not free either. Recycling it was the identity defect: `door_1` died,
+    // its number went straight to a different door across the room, and when THAT one died it overwrote the
+    // original's ghost — so the real door_1 came back as door_3. Reserved names only raise the counter; they
+    // never mark `preferred_name` occupied, since that ghost is precisely the one being consumed here.
+    for (const auto& nm : reserved_names)
+        bump(nm);
+    // RE-ACQUISITION: a door that flickered out and came back keeps its name, so downstream consumers see the
+    // same object rather than a fresh one. (The DSR id necessarily changes — the old node was deleted.)
+    const std::string name = preferred_free ? std::string(preferred_name)
+                                            : "door_" + std::to_string(max_n + 1);
+
+    // Generic `object` node named "door_*"; class carried in object_subtype ("door"). Every
+    // get_nodes_by_type("object") MUST therefore be paired with a starts_with("door") filter.
+    DSR::Node door_node = DSR::Node::create<object_node_type>(name);
+    // Display asset for the retina 3D viewer (relative to its meshes/ root); the viewer loads & scales it
+    // to the fitted box (cortex mesh_path contract — the agent owns its appearance). Empty/missing asset
+    // falls back to the fitted box.
+    G_->add_or_modify_attrib_local<mesh_path_att>(door_node, std::string("door_concept/meshes/door.obj"));
+    G_->add_or_modify_attrib_local<mesh_texture_path_att>(door_node, std::string("door_concept/meshes/door_basecolor.jpg"));
+    G_->add_or_modify_attrib_local<width_m_att> (door_node, cfg_.door_prior_w_m);
+    G_->add_or_modify_attrib_local<depth_m_att> (door_node, cfg_.door_thickness_m);
+    G_->add_or_modify_attrib_local<height_m_att>(door_node, cfg_.door_prior_h_m);
+    G_->add_or_modify_attrib_local<object_subtype_att>(door_node, std::string("door"));  // type-agnostic consumers
+
+    // A door HANGS FROM ITS WALL: parent the node to the nearest "wall_*" node (its RT pose is then the door
+    // in the wall frame), falling back to the room only if no wall nodes exist yet. write_rt_pose keeps it
+    // on the right wall each cycle.
+    const WallRef wall = resolve_wall(room_node_id, {centroid_room.x(), centroid_room.y()});
+    const std::uint64_t parent_id = wall.ok ? wall.id : room_node_id;
+    G_->add_or_modify_attrib_local<level_att> (door_node, wall.ok ? 5 : 3);
+    G_->add_or_modify_attrib_local<parent_att>(door_node, parent_id);
+    {
+        const float rpx = G_->get_attrib_by_name<pos_x_att>(room_opt.value()).value_or(200.f);
+        const float rpy = G_->get_attrib_by_name<pos_y_att>(room_opt.value()).value_or(200.f);
+        G_->add_or_modify_attrib_local<pos_x_att>(door_node, rpx + 150.f);
+        G_->add_or_modify_attrib_local<pos_y_att>(door_node, rpy +  50.f);
+    }
+
+    rc::provenance::stamp_creation(*G_, door_node);   // birth stamp: epoch ms + local ISO-8601
+    const auto id_opt = G_->insert_node(door_node);
+    if (not id_opt.has_value())
+        return 0;
+
+    if (wall.ok)
+    {
+        if (auto wnode = G_->get_node(wall.id); wnode.has_value())
+        {
+            // At birth the heading is unknown → align the door to the wall (lyaw = 0); the fit refines it.
+            const auto lp = door_in_wall(centroid_room.x(), centroid_room.y(), wall.yaw, wall.mid, wall.yaw, wall.z0);
+            rt_api_->insert_or_assign_edge_RT(wnode.value(), id_opt.value(),
+                                              {lp.x, lp.y, lp.z}, {0.0f, 0.0f, 0.0f});
+        }
+    }
+    else
+        rt_api_->insert_or_assign_edge_RT(room_opt.value(), id_opt.value(),
+                                          {centroid_room.x(), centroid_room.y(), 0.0f}, {0.0f, 0.0f, 0.0f});
+
+    if (relayout_)
+        relayout_();
+
+    std::print("door_concept: [tracker] BIRTH '{}' id={} at room ({:.2f},{:.2f}) parent={} ({})\n",
+               name, id_opt.value(), centroid_room.x(), centroid_room.y(),
+               parent_id, wall.ok ? "wall" : "room");
+    return id_opt.value();
+}
+
+bool DoorSceneGraph::persist_door_belief(DoorInstance& inst, std::uint64_t node_id,
+                                           std::uint64_t room_id, float free_energy)
+{
+    auto node_opt = G_->get_node(node_id);
+    if (not node_opt.has_value())
+        return false;
+
+    step_write_model(inst, node_opt.value(), room_id, free_energy);
+    return true;
+}
+
+void DoorSceneGraph::step_write_model(DoorInstance& inst, DSR::Node& node,
+                                       std::uint64_t room_id, float free_energy)
+{
+    const auto& s = inst.model.state();
+
+    // Publish gate: only (re)write the geometry + mesh when the fitted dims/pose moved beyond a few
+    // mm / mrad since the last publish. The retina renders the MESH attribute (not the coarsely
+    // dead-banded RT pose), rebuilt here every cycle from the raw fit — so writing it from the
+    // sub-cm oscillating state each frame makes the viewer door JITTER even though room→door is
+    // static. Freezing the mesh once settled removes the jitter. Mirrors bottle_concept's pub gate.
+    constexpr float kPosEps = 0.003f;   // 3 mm
+    constexpr float kYawEps = 0.005f;   // ~0.3°
+    const bool geometry_changed =
+        std::abs(s.cx - inst.last_pub_cx) > kPosEps or
+        std::abs(s.cy - inst.last_pub_cy) > kPosEps or
+        std::abs(s.w - inst.last_pub_w) > kPosEps or
+        std::abs(s.thickness - inst.last_pub_h) > kPosEps or
+        std::abs(s.h - inst.last_pub_H) > kPosEps or
+        std::abs(static_cast<float>(std::remainder(s.yaw - inst.last_pub_yaw, 2.0 * M_PI))) > kYawEps;
+
+    // Geometry attributes + mesh (gated to kill the viewer jitter once settled).
+    // Map the door panel to the standard DSR geometry attrs consumers read:
+    //   width_m←w (along wall), depth_m←thickness (across wall), height_m←h.
+    if (geometry_changed)
+    {
+        G_->add_or_modify_attrib_local<width_m_att> (node, s.w);
+        G_->add_or_modify_attrib_local<depth_m_att> (node, s.thickness);
+        G_->add_or_modify_attrib_local<height_m_att>(node, s.h);
+        G_->add_or_modify_attrib_local<model_generation_att>(node, ++inst.model_generation);
+        write_door_mesh(inst, node);   // mesh for the retina 3D viewer
+        inst.last_pub_cx = s.cx; inst.last_pub_cy = s.cy;
+        inst.last_pub_w  = s.w;  inst.last_pub_h  = s.thickness;
+        inst.last_pub_H  = s.h;  inst.last_pub_yaw = s.yaw;
+    }
+    G_->add_or_modify_attrib_local<free_energy_att>(node, free_energy);
+
+    // The accumulated support bank is NOT published. It never was voxels: the points are the 3-D support of
+    // a segmentation mask, split by this model's own SDF into on- and off-surface. The graph export was up to
+    // SupportBankMaxPoints (4000) points x 3 floats, per object, per publish, into a CRDT graph that nothing
+    // read — the same shape as the unbounded dot cloud that pinned an agent at 100% CPU. Gated off 2026-08-14,
+    // and the *_voxel_bank_pts attribute registrations were removed from cortex on 2026-08-14, so the gate,
+    // the knob and the attribute are all gone rather than lying dormant.
+    //
+    // THE BANK ITSELF STAYS and is load-bearing: evaluate_shape() fits the round hypothesis to
+    // inst.support_bank_pts for the round-vs-square model selection, and DumpCloudPath exports it for the
+    // offline harness. Both are local reads. It was only ever the graph traffic that had no consumer.
+
+
+    // Latest residual points (model-unexplained) for the retina's residual layer — it reads
+    // residual_pts_att but nothing was writing it, so that layer was always empty.
+    {
+        std::vector<float> res_flat;
+        res_flat.reserve(inst.last_residual_pts.size() * 3);
+        for (const auto& p : inst.last_residual_pts) { res_flat.push_back(p.x()); res_flat.push_back(p.y()); res_flat.push_back(p.z()); }
+        G_->add_or_modify_attrib_local<residual_pts_att>(node, res_flat);
+    }
+
+    // Active-perception channel for the controller's local lock-on search:
+    //  - door_roi_offset [ox, oy]: normalised image-centre offset of the projected model
+    //    (drive →0 to centre the door in the frame).
+    //  - door_roi_fill: projected extent fraction (drive toward a sweet-spot for stand-off/scale).
+    //  - door_roi_valid: model currently projects in front of the camera.
+    //  - door_detection_alive / _confidence / _frames_since: is YOLO firing here, and how strongly.
+    G_->add_or_modify_attrib_local<door_roi_offset_att>(node,
+        std::vector<float>{inst.roi_offset_x, inst.roi_offset_y});
+    G_->add_or_modify_attrib_local<door_roi_fill_att>(node, inst.roi_fill);
+    G_->add_or_modify_attrib_local<door_roi_valid_att>(node, inst.roi_valid);
+    G_->add_or_modify_attrib_local<door_detection_alive_att>(node, inst.detection_alive);
+    G_->add_or_modify_attrib_local<door_detection_confidence_att>(node, inst.last_mask_confidence);
+    G_->add_or_modify_attrib_local<door_frames_since_detection_att>(node, inst.frames_since_detection);
+
+    G_->update_node(node);
+
+    write_rt_pose(room_id, inst);
+    // Upload the door pose covariance after the pose write (so a rare >5 cm RT recreate doesn't
+    // clobber it). `force` on a geometry republish; otherwise the write self-gates on a meaningful
+    // uncertainty change, so a stationary-but-tightening door stays current without edge churn.
+    write_rt_covariance(room_id, inst, geometry_changed);
+}
+
+void DoorSceneGraph::write_rt_covariance(std::uint64_t room_id, DoorInstance& inst, bool force)
+{
+    if (not cfg_.rt_cov_upload or room_id == 0)
+        return;
+
+    const float scale = std::max(1e-6f, cfg_.rt_cov_scale);
+
+    if (not inst.ai2_initialized)
+        return;   // belief not seeded yet — nothing calibrated to publish
+
+    // The belief carries a 3×3 Σ over the WALL-FRAME [s,w,h]. Only s (the along-wall offset) is a position
+    // DOF; yaw is FIXED by the (trusted, nominal) wall (small floor variance), z is pinned to the floor,
+    // and w,h are SIZE (not pose) so they don't enter the RT-edge pose covariance. The RT edge is expressed
+    // in the PARENT frame, so when the door hangs from its wall the covariance goes in WALL-LOCAL axes
+    // (s = local x along the wall); in the room-frame fallback it is the rank-1 σ_s²·(u uᵀ) along u.
+    const std::uint64_t parent = inst.wall_node_id != 0 ? inst.wall_node_id : room_id;
+    const auto  S  = inst.ai2_belief.covariance();
+    const float vs = scale * S(0, 0);   // along-wall position variance σ_s² (m²)
+    const Eigen::Vector2f u = inst.ai2_belief.params().wall_u;
+    const float chain_along = u.x() * u.x() * inst.chain_cov_xx + u.y() * u.y() * inst.chain_cov_yy;
+    const float vz   = inst.ai2_belief.params().floor_std * inst.ai2_belief.params().floor_std;   // cz pinned
+    // This covariance describes the APERTURE, which is what the RT edge carries (see write_rt_pose). Both
+    // constants below are therefore unconditionally true and stay true once the leaf can swing: an aperture
+    // is rigid in its wall by definition, so its yaw is the wall's and it has no across-wall freedom.
+    constexpr float kWallYawVar = 3.0e-4f;   // (~1°)²: the wall fixes the APERTURE yaw; the polygon is trusted
+    float vx, vy, vyaw = kWallYawVar;
+    if (inst.wall_node_id != 0)
+    {
+        vx = vs + chain_along;   // along wall (local x)
+        vy = 1.0e-4f;            // across wall (local y) — the APERTURE lies in the wall plane
+    }
+    else
+    {
+        vx = vs * u.x() * u.x() + inst.chain_cov_xx;
+        vy = vs * u.y() * u.y() + inst.chain_cov_yy;
+    }
+
+    // Everything from here — the self-gate, the 6×6 block layout, the edge write, the trace bookkeeping
+    // and the readout — is the SHARED publisher (common/rt_covariance/rt_covariance.h). What stays above is
+    // the only part that is genuinely this object's: the mapping from its own DOF to the six variances.
+    const rc::rtcov::Se3Var v{vx, vy, vz, rc::rtcov::kFlatRollPitchVar, rc::rtcov::kFlatRollPitchVar, vyaw};
+    rc::rtcov::publish(*G_, parent, inst.node_id, v, inst.last_pub_cov_trace, force, inst.node_name);
+}
+
+std::vector<float> DoorSceneGraph::make_door_mesh(const DoorState& s)
+{
+    // Flat triangle list (room frame): ONE thin panel box (12 triangles) drawn at the LEAF's current pose
+    // (door_geometry.h). Local x = hinge → free edge, local y = across the face, local z = up.
+    //
+    // The leaf, not the aperture: this is the one DSR channel in which an open door is representable, since
+    // the RT edge and width_m/depth_m/height_m all describe the static aperture by design. (No consumer
+    // reads it for doors today — retina/src/scene_processor.cpp:727 draws only table/chair/cabinet
+    // carcasses and suppresses any node publishing a mesh_path — so this is free to follow the leaf now and
+    // is where M2/M3 rendering will hook in.)
+    std::vector<float> verts;
+    verts.reserve(108);
+
+    const door::LeafPose L = door::leaf_pose_from_box(s.cx, s.cy, s.cz, s.yaw, s.w, s.h, s.thickness);
+
+    auto push_box = [&](float bx, float by, float bz, float hw, float hd, float hh)
+    {
+        auto push = [&](float lx, float ly, float lz)
+        {
+            verts.push_back(bx + L.ex.x() * lx + L.ey.x() * ly);
+            verts.push_back(by + L.ex.y() * lx + L.ey.y() * ly);
+            verts.push_back(bz + lz);
+        };
+        push(-hw,-hd,-hh); push( hw,-hd,-hh); push( hw, hd,-hh);  // bottom
+        push(-hw,-hd,-hh); push( hw, hd,-hh); push(-hw, hd,-hh);
+        push(-hw,-hd, hh); push( hw, hd, hh); push( hw,-hd, hh);  // top
+        push(-hw,-hd, hh); push(-hw, hd, hh); push( hw, hd, hh);
+        push(-hw,-hd,-hh); push( hw,-hd,-hh); push( hw,-hd, hh);  // front -y
+        push(-hw,-hd,-hh); push( hw,-hd, hh); push(-hw,-hd, hh);
+        push( hw, hd,-hh); push(-hw, hd,-hh); push(-hw, hd, hh);  // back  +y
+        push( hw, hd,-hh); push(-hw, hd, hh); push( hw, hd, hh);
+        push(-hw,-hd,-hh); push(-hw,-hd, hh); push(-hw, hd, hh);  // left  -x
+        push(-hw,-hd,-hh); push(-hw, hd, hh); push(-hw, hd,-hh);
+        push( hw,-hd,-hh); push( hw, hd,-hh); push( hw, hd, hh);  // right +x
+        push( hw,-hd,-hh); push( hw, hd, hh); push( hw,-hd, hh);
+    };
+
+    // Panel: half-extents (w/2 along wall, thickness/2 across, h/2 up); centre at (cx,cy,cz+h/2).
+    push_box(s.cx, s.cy, s.cz + 0.5f * s.h, 0.5f * s.w, 0.5f * s.thickness, 0.5f * s.h);
+    return verts;
+}
+
+void DoorSceneGraph::write_door_mesh(DoorInstance& inst, DSR::Node& node)
+{
+    const std::vector<float> verts = make_door_mesh(inst.model.state());
+    G_->add_or_modify_attrib_local<mesh_vertices_att>(node, verts);
+}
+
+void DoorSceneGraph::write_rt_pose(std::uint64_t room_id, DoorInstance& inst)
+{
+    if (room_id == 0 or not rt_api_)
+        return;
+
+    const auto& s = inst.model.state();
+    // ★ EVERYTHING below keys on the APERTURE (ap_cx, ap_cy, ap_yaw) — the static hole in the wall — NEVER
+    // on the leaf. The door node is a PLACE IN THE BUILDING: what the robot navigates through is the hole,
+    // not the panel, and the aperture is what is rigidly attached to the wall this edge hangs from.
+    // Publishing the swinging leaf here would encode a revolute joint as a rigid transform, and would break
+    // three things at once: the 5 cm dead-band below would silently swallow a pure hinge rotation (leaving
+    // a stale edge), the {0,0,lyaw} euler would misrepresent it, and resolve_wall — keyed on the centre —
+    // could flip its nearest-wall answer once a 90° swing moved that centre by w/2, triggering a spurious
+    // re-parent + RT edge delete/recreate. At phi = 0 these are identical to the leaf values.
+    const float ap_cx = s.ap_cx, ap_cy = s.ap_cy, ap_yaw = s.ap_yaw;
+
+    // A door hangs from its WALL: resolve the nearest wall node and publish the pose in that wall's frame.
+    // Falls back to the room only while no wall nodes exist. If the parent changes (first association, or the
+    // door moved onto another wall) we RE-PARENT: drop the stale RT edge and update parent/level.
+    const WallRef wall = resolve_wall(room_id, {ap_cx, ap_cy});
+    const std::uint64_t new_parent = wall.ok ? wall.id : room_id;
+
+    auto door_opt = G_->get_node(inst.node_id);
+    if (not door_opt.has_value())
+        return;
+    const std::uint64_t old_parent = G_->get_attrib_by_name<parent_att>(door_opt.value()).value_or(room_id);
+    const bool reparent = new_parent != old_parent;
+
+    // Dead-band: suppress RT edge updates below ~5 cm to avoid pos churn from gradient oscillations — but
+    // NEVER skip a re-parent (the door must move onto its wall even when it hasn't translated).
+    constexpr float kMinWriteDistSq = 0.05f * 0.05f;
+    const float dx = ap_cx - inst.last_written_cx;
+    const float dy = ap_cy - inst.last_written_cy;
+    if (not reparent and dx * dx + dy * dy < kMinWriteDistSq)
+        return;
+
+    // Door node origin = BASE on the floor (z=0 in room). In the wall frame that base sits z0 below the wall
+    // origin (which is at half room height). Every consumer assumes a base origin: the retina box
+    // (z∈[origin, origin+height]) and bottle_concept's door-top support test (top = origin.z + height).
+    float lx = ap_cx, ly = ap_cy, lz = 0.0f, lyaw = ap_yaw;   // room-frame fallback
+    std::optional<DSR::Node> parent_node;
+    if (wall.ok)
+    {
+        parent_node = G_->get_node(wall.id);
+        if (parent_node.has_value())
+        {
+            const auto lp = door_in_wall(ap_cx, ap_cy, ap_yaw, wall.mid, wall.yaw, wall.z0);
+            lx = lp.x; ly = lp.y; lz = lp.z; lyaw = lp.yaw;
+        }
+    }
+    if (not parent_node.has_value())
+        parent_node = G_->get_node(room_id);
+    if (not parent_node.has_value())
+        return;
+
+    if (reparent)
+    {
+        G_->delete_edge(old_parent, inst.node_id, "RT");   // a node must have exactly one RT parent
+        G_->add_or_modify_attrib_local<parent_att>(door_opt.value(), new_parent);
+        G_->add_or_modify_attrib_local<level_att>(door_opt.value(), wall.ok ? 5 : 3);
+        G_->update_node(door_opt.value());
+        if (relayout_) relayout_();
+    }
+    inst.wall_node_id = wall.ok ? wall.id : 0;
+
+    rt_api_->insert_or_assign_edge_RT(parent_node.value(), inst.node_id, {lx, ly, lz}, {0.0f, 0.0f, lyaw});
+    inst.last_written_cx = ap_cx;
+    inst.last_written_cy = ap_cy;
+}
+
+void DoorSceneGraph::write_epistemic_proposal(DSR::Node& node, const EpistemicProposal& prop)
+{
+    G_->add_or_modify_attrib_local<epistemic_target_x_m_att>  (node, prop.epistemic_target_x_m);
+    G_->add_or_modify_attrib_local<epistemic_target_y_m_att>  (node, prop.epistemic_target_y_m);
+    G_->add_or_modify_attrib_local<epistemic_target_yaw_rad_att>(node, prop.epistemic_target_yaw_rad);
+    G_->add_or_modify_attrib_local<epistemic_gain_att>        (node, prop.epistemic_gain);
+    G_->add_or_modify_attrib_local<epistemic_pending_att>     (node, true);
+    G_->update_node(node);
+}
+
+
+// ─── the door INTERACTION channel ────────────────────────────────────────────────────────────────
+void DoorSceneGraph::write_interaction_state(DSR::Node& node, const rc::door::InteractionState& st)
+{
+    // ★UNMEASURED IS PUBLISHED AS AN OUT-OF-RANGE SENTINEL, NOT AS ZERO. A predicate reads whatever is on
+    // the node, so a stale probability would let a contract satisfy itself on a cycle the agent learned
+    // nothing. But ZERO IS NOT NEUTRAL EITHER, which is the mistake this replaces: 0 is also exactly what
+    // a genuinely SHUT door, a robot genuinely far away, and a crossing genuinely not started all read —
+    // so "not measured" and "measured, and the answer is no" became the same number. That is the same
+    // conflation the existence channel draws a hard line through ("never looked at" is not "looked at and
+    // empty"), and this agent's own estimate_phi already has the right idiom: support_at returns -1 for a
+    // hypothesis that cannot be resolved, commented "Not a score of zero."
+    // ★It matters MOST in the durable record. passage_open_prob is copied into etc/passages.csv and read
+    // back months later; a 0 there that might mean either "shut" or "we could not tell" is a corrupted
+    // row that nothing downstream can repair.
+    // Every sentinel is outside its quantity's own range, so it can never be a legitimate reading, and
+    // every contract predicate (>= 0.90, >= 0.70) still fails on it — which is the conservative behaviour
+    // the old zero was chosen for, kept, without the ambiguity it bought it with.
+    constexpr float kUnmeasured = -1.0f;   // for [0,1] probabilities and the [0, pi/2] angle
+    // ⚠crossing progress is signed: -1 is a LEGITIMATE reading (back where the claim started), so its
+    // sentinel has to sit outside [-1,+1] instead.
+    constexpr float kUnmeasuredSigned = -2.0f;
+    G_->add_or_modify_attrib_local<door_phi_rad_att>          (node, st.phi_known    ? st.phi_rad  : kUnmeasured);
+    G_->add_or_modify_attrib_local<door_open_prob_att>        (node, st.p_open_known ? st.p_open   : kUnmeasured);
+    G_->add_or_modify_attrib_local<door_reach_prob_att>       (node, st.p_reach_known? st.p_reach  : kUnmeasured);
+    G_->add_or_modify_attrib_local<door_crossing_progress_att>(node, st.crossing_known ? st.crossing_progress
+                                                                                       : kUnmeasuredSigned);
+}
+
+}  // namespace rc
