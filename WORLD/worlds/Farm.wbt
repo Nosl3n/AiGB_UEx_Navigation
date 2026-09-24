@@ -1,0 +1,39 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/UnevenTerrain.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/trees/protos/PalmTree.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/trees/protos/Tree.proto"
+
+WorldInfo {
+}
+Viewpoint {
+  orientation 0.18996809482485288 0.8969695822443939 -0.39919630694300406 0.9769217348720224
+  position -75.1887846504426 24.866339056179147 90.6503978785977
+}
+TexturedBackground {
+}
+TexturedBackgroundLight {
+}
+UnevenTerrain {
+  size 200 200 10
+}
+PalmTree {
+  translation 0 -5.05 5.97
+}
+PalmTree {
+  translation 0 4.73 5.97
+  name "palm tree(1)"
+}
+PalmTree {
+  translation 0 0 5.97
+  name "palm tree(2)"
+}
+PalmTree {
+  translation 0 9.78 5.97
+  name "palm tree(3)"
+}
+Tree {
+  translation 0 -12 7
+}
