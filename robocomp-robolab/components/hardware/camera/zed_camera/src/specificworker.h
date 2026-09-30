@@ -28,7 +28,10 @@
 #define SPECIFICWORKER_H
 #define POSE
 
+// ZED SDK is optional: without it (HAVE_ZED_SDK undefined) only Config.Simulated = true works.
+#ifdef HAVE_ZED_SDK
 #include <sl/Camera.hpp>
+#endif
 #include <opencv2/opencv.hpp>
 #include <atomic>
 #include <memory>
@@ -48,6 +51,7 @@ class ZedDDSPublisher;
 
 #include <genericworker.h>
 
+#ifdef HAVE_ZED_SDK
 // Basic structure to compare timestamps of a sensor. Determines if a specific sensor data has been updated or not.
 struct TimestampHandler {
 
@@ -72,6 +76,7 @@ struct TimestampHandler {
 
     sl::Timestamp ts_imu = 0, ts_baro = 0, ts_mag = 0; // Initial values
 };
+#endif
 
 /**
  * \brief Class SpecificWorker implements the core functionality of the component.
@@ -108,6 +113,7 @@ class SpecificWorker : public GenericWorker
         RoboCompLidar3D::TData Lidar3D_getLidarDataWithThreshold2d(std::string name, float distance, int decimationDegreeFactor);
 
 
+#ifdef HAVE_ZED_SDK
         // Create a ZED camera object
         sl::Camera zed;
 
@@ -115,6 +121,7 @@ class SpecificWorker : public GenericWorker
         sl::InitParameters init_parameters;
 
         sl::CameraParameters cam_params;
+#endif
 
         bool simulated = true;
         bool display = false;
@@ -125,6 +132,7 @@ class SpecificWorker : public GenericWorker
         int  camera_fps = 30;                // Config.FPS — caps the processing/publish rate
         Eigen::Affine3f extrinsic;
 
+#ifdef HAVE_ZED_SDK
         sl::Mat image, depth, point_cloud;
         sl::ERROR_CODE returned_state;
 
@@ -133,14 +141,17 @@ class SpecificWorker : public GenericWorker
         sl::Pose zed_pose;
         sl::Transform translation_left_to_center;
         //---- SENSORS
-        std::thread sensor_thread;
         sl::SensorsData sensors_data;
         TimestampHandler ts;
+#endif
+        std::thread sensor_thread;
         std::atomic<bool> running;
         //----TF cam2robot
         Eigen::Affine3f T_cam2base = Eigen::Affine3f::Identity();
         float wrapToPi(float angle_rad);
+#ifdef HAVE_ZED_SDK
         void transformPose(sl::Transform &pose, sl::Transform transform);
+#endif
 
     public slots:
 
@@ -191,7 +202,9 @@ class SpecificWorker : public GenericWorker
         // Acquire and build the TRGBD frame (+ optional color cloud) for each source.
         // Return the number of valid 3D points, or -1 (simulated only) when no new
         // source frame has arrived since the last call.
+#ifdef HAVE_ZED_SDK
         long build_real_rgbd(RoboCompCameraRGBDSimple::TRGBD &rgbd, RoboCompLidar3D::TColorCloudData &colorCloud);
+#endif
         long build_simulated_rgbd(RoboCompCameraRGBDSimple::TRGBD &rgbd, RoboCompLidar3D::TColorCloudData &colorCloud);
         // Common tail: publish (Ice + DDS) from the local frame (no lock held during
         // serialization), store it into the shared buffers, then optionally display.

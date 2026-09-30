@@ -41,6 +41,9 @@
 #include <webots/Supervisor.hpp>
 #include <webots/Accelerometer.hpp>
 #include <webots/Gyro.hpp>
+#include <webots/GPS.hpp>
+#include <webots/InertialUnit.hpp>
+#include <webots/Compass.hpp>
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 #include <opencv2/opencv.hpp>
@@ -211,6 +214,15 @@ public:
 	RoboCompIMU::Orientation IMU_getOrientation();
 	void IMU_resetImu();
 
+	// GPS (Husky / field worlds). Units: degrees and metres. getPos is the LOCAL frame: metres from the
+	// world's gpsReference (or from the last resetPos()), x = east, y = north, z = up -- which is also
+	// the Webots world frame when WorldInfo.northDirection is 0 1 0. Prefer getPos / getUTMData over
+	// getData: the IDSL carries lat/lon as float, and a float degree only resolves ~1 m.
+	bool GPS_getData(float &latitude, float &longitude, float &altitude);
+	bool GPS_getPos(float &x, float &y, float &z);
+	bool GPS_getUTMData(int &xzone, std::string &yzone, double &eastering, double &northing);
+	void GPS_resetPos();
+
 	RoboCompLaser::TLaserData Laser_getLaserAndBStateData(RoboCompGenericBase::TBaseState &bState);
 	RoboCompLaser::LaserConfData Laser_getLaserConfData();
 	RoboCompLaser::TLaserData Laser_getLaserData();
@@ -302,6 +314,38 @@ private:
     webots::PositionSensor *ps[4];
     webots::Accelerometer* accelerometer;
     webots::Gyro* gyroscope;
+    webots::GPS* gps_ = nullptr;                   // "gps"           (HuskyA300.proto; absent on Shadow)
+    webots::InertialUnit* inertial_unit_ = nullptr;// "inertial unit" -> IMU orientation when present
+    webots::Compass* compass_ = nullptr;           // "compass"       -> IMU magnetic field when present
+    // DEF of the robot node in the world. Was hardcoded "shadow"; config Robot.Def.
+    std::string robot_def_ = "shadow";
+
+    // ── GPS snapshot (compute thread writes, RPC threads read) ─────────────────────────────────
+    // Webots' WGS84 mode converts the LOCAL position to lat/lon by adding it to the UTM coordinates
+    // of WorldInfo.gpsReference (verified 2026-09-30: UTM(lat,lon) - UTM(ref) reproduces the antenna's
+    // world position to < 1 mm, while a tangent-plane ENU was off by 12 cm at 5 m -- that is the UTM
+    // grid convergence, ~1.3 deg at Badajoz). So the local frame is computed the same way.
+    struct GpsState
+    {
+        bool   valid = false;
+        double lat = 0, lon = 0, alt = 0;   // deg, deg, m
+        int    zone = 0; char band = 'N';
+        double east = 0, north = 0;         // UTM, m
+        double x = 0, y = 0, z = 0;         // local, m (from origin_*)
+    };
+    GpsState gps_state_;
+    std::mutex gps_mutex_;
+    bool   gps_wgs84_ = false;              // false: Webots "local" coordinates, values are already x,y,z
+    double gps_origin_east_ = 0, gps_origin_north_ = 0, gps_origin_alt_ = 0;
+    int    gps_origin_zone_ = 0;
+    bool   gps_origin_set_ = false;
+    std::atomic<bool> gps_reset_requested_{false};
+    int    gps_period_ms_ = 100;            // 10 Hz, a typical RTK receiver rate
+    double nominal_orient_var_ = 4e-6;      // rad^2, (0.002 rad)^2 -- matches the proto's noise
+    void init_gps_reference();
+    void update_gps_data();
+    static void wgs84_to_utm(double lat_deg, double lon_deg, int force_zone,
+                             int &zone, char &band, double &east, double &north);
 	webots::Camera* zed;
 	webots::RangeFinder* zedRangeFinder;
 	// DEF -> node cache for setDoorAngle. Replaces the single hard-wired CONTROLLABLE_DOOR: which door
@@ -417,11 +461,18 @@ private:
     // turning FASTER than the wheels implied, which is not a thing wheels can do. That was piso.wbt
     // missing the ContactProperties that make mecanum rollers slide (see the note in the world file);
     // without them the rollers grip and the base is a skid-steer wearing mecanum wheels.
-    enum class BaseKinematics { Mecanum, Differential };
+    enum class BaseKinematics { Mecanum, Differential, Skid };
     BaseKinematics base_kinematics_ = BaseKinematics::Mecanum;
     int    wheel_count_  = 4;
     double wheel_radius_ = WHEEL_RADIUS;
     double half_track_   = LX + LY;      // the c above
+    // Skid-steer / differential effective-track multiplier (Clearpath's wheel_separation_multiplier).
+    // A skid-steer turns by dragging its wheels sideways, so the body rotates LESS than the wheel
+    // speed difference implies; c_eff = half_track_ * track_scale_ is used by BOTH the IK and the FK.
+    // MEASURED on HuskyA300.proto in husky_test.wbt (2026-09-30, isotropic mu 0.9): pivot 1.70,
+    // 0.6 m/s arc 2.27 -- it depends on the manoeuvre, so no single value makes odometry exact
+    // (the gyro still has to correct it). Clearpath ships 1.875 for the real Husky.
+    double track_scale_  = 1.0;
     bool   warned_advx_ignored_ = false; // a differential base cannot strafe; say so once, not per call
 
     struct WheelOdometry

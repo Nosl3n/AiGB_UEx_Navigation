@@ -8,13 +8,14 @@ import "VisualElements.idsl";
 import "Webots2Robocomp.idsl";
 import "DoorControl.idsl";
 import "IMU.idsl";
+import "GPS.idsl";
 import "FullPoseEstimationPub.idsl";
 
 Component Webots2Robocomp
 {
     Communications
     {
-        implements Laser, Lidar3D, CameraRGBDSimple, Camera360RGB, OmniRobot, VisualElements, Webots2Robocomp, IMU, DoorControl;
+        implements Laser, Lidar3D, CameraRGBDSimple, Camera360RGB, OmniRobot, VisualElements, Webots2Robocomp, IMU, DoorControl, GPS;
         subscribesTo JoystickAdapter;
         publishes FullPoseEstimationPub;
     };

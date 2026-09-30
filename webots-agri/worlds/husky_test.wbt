@@ -1,0 +1,65 @@
+#VRML_SIM R2025a utf8
+# F1 test bench: flat ground + a few obstacles, to validate the Husky A300 physics, sensors and the
+# bridge's skid-steer kinematics before building the crop field (F3).
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/RectangleArena.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/factory/containers/protos/WoodenBox.proto"
+EXTERNPROTO "../protos/HuskyA300.proto"
+
+WorldInfo {
+  info [ "AiGB UEx - Husky A300 test bench" ]
+  basicTimeStep 8
+  # GPS: WGS84 so the "gps" device returns latitude / longitude / altitude.
+  # Reference = world origin, near the UEx campus in Badajoz. With northDirection 0 1 0, world +Y is
+  # geographic north, +X is east (ENU).
+  gpsCoordinateSystem "WGS84"
+  gpsReference 38.8794 -6.9707 186
+  northDirection 0 1 0
+  contactProperties [
+    ContactProperties {
+      # Skid-steer on firm soil. Isotropic grip: a skid-steer turns by dragging its wheels sideways,
+      # so lateral slip is part of the model (and the source of the odometry rotation scrub the
+      # wheels+IMU fusion must correct). softCFM: four coplanar contacts on a rigid body rock under a
+      # hard solver; a little compliance shares the load smoothly.
+      material1 "HuskyWheelMat"
+      coulombFriction [ 0.9 ]
+      bounce 0
+      softCFM 0.0005
+    }
+  ]
+}
+Viewpoint {
+  orientation -0.25 0.25 0.93 1.64
+  position 0.8 -6.5 3.6
+  follow "husky"
+}
+TexturedBackground {
+  texture "noon_cloudy_countryside"
+}
+TexturedBackgroundLight {
+  texture "noon_cloudy_countryside"
+}
+RectangleArena {
+  floorSize 30 30
+  floorTileSize 2 2
+  floorAppearance PBRAppearance {
+    baseColor 0.45 0.35 0.22
+    roughness 1
+    metalness 0
+  }
+  wallHeight 0.3
+}
+WoodenBox {
+  translation 3 4 0.3
+  size 0.6 0.6 0.6
+}
+WoodenBox {
+  translation -2.5 6 0.3
+  name "wooden box(1)"
+  size 0.6 0.6 0.6
+}
+DEF husky HuskyA300 {
+  translation 0 0 0
+}

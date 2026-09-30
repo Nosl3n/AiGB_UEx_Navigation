@@ -115,9 +115,23 @@ void SpecificWorker::initialize()
             wheel_radius_ = 0.100;   // SVD48VBase/etc/config_diferential: wheelRadius = 100 mm
             half_track_   = 0.259;   //                                    axesLength  = 518 mm, /2
         }
+        else if (kinematics == "skid")
+        {
+            // Four driven wheels, left pair and right pair commanded together (Husky A300).
+            // Defaults: Clearpath husky_description, also HuskyA300.proto's field defaults.
+            base_kinematics_ = BaseKinematics::Skid;
+            wheel_count_  = 4;
+            wheel_radius_ = 0.1651;
+            half_track_   = 0.5708 / 2.0;
+        }
         // ...overridable, because a future world may differ from the one robot these came from.
         try { wheel_radius_ = configLoader.get<double>("Base.WheelRadius"); } catch(...) {}
         try { half_track_   = configLoader.get<double>("Base.HalfTrack"); } catch(...) {}
+        try { track_scale_  = configLoader.get<double>("Base.TrackScale"); } catch(...) {}
+        if (track_scale_ <= 0.0) track_scale_ = 1.0;
+        try { robot_def_ = configLoader.get<std::string>("Robot.Def"); } catch(...) {}
+        try { gps_period_ms_ = configLoader.get<int>("GPS.Period"); } catch(...) {}
+        try { nominal_orient_var_ = configLoader.get<double>("IMU.NominalOrientVar"); } catch(...) {}
 
         // ── Synthetic sensor error — see the header for why the two channels differ ──
         try { sensor_noise_enabled_ = configLoader.get<bool>("SensorNoise.Enabled"); } catch(...) {}
@@ -161,7 +175,10 @@ void SpecificWorker::initialize()
         last_read.store(std::chrono::high_resolution_clock::now());
 
         robot = new webots::Supervisor();
-        robotNode = robot->getFromDef("shadow");
+        robotNode = robot->getFromDef(robot_def_);
+        if (robotNode == nullptr)
+            std::cout << "No robot node with DEF '" << robot_def_ << "' in this world -- set Robot.Def. "
+                      << "Ground-truth pose, FullPose and IMU orientation will be missing." << std::endl;
         // Resolved once: getField() is a name lookup against the simulator.
         if(robotNode)
         {
@@ -175,8 +192,11 @@ void SpecificWorker::initialize()
         // ShadowDiff.proto and the sign convention in the forward kinematics.
         const char *mecanumMotorNames[4] = {"wheel2", "wheel1", "wheel4", "wheel3"};
         const char *diffMotorNames[2]    = {"wheel_left", "wheel_right"};
-        const char **motorNames = base_kinematics_ == BaseKinematics::Differential
-                                      ? diffMotorNames : mecanumMotorNames;
+        // Skid is {left pair, right pair}: indices 0,1 get the left speed and 2,3 the right one.
+        const char *skidMotorNames[4]    = {"front_left", "rear_left", "front_right", "rear_right"};
+        const char **motorNames = base_kinematics_ == BaseKinematics::Differential ? diffMotorNames
+                                : base_kinematics_ == BaseKinematics::Skid         ? skidMotorNames
+                                                                                   : mecanumMotorNames;
         //const char *sensorNames[4] = {"wheel1sensor", "wheel2sensor", "wheel3sensor", "wheel4sensor"};
 
         // Inicializa los sensores soportados.
@@ -190,6 +210,11 @@ void SpecificWorker::initialize()
         gyroscope = robot->getGyro("gyro");
         zedRangeFinder = robot->getRangeFinder("zed-ranger");
         zed = robot->getCamera("zed");
+        // Field sensors (HuskyA300.proto). getDevice() on a missing name returns nullptr and warns;
+        // Shadow worlds have none of these, which is fine.
+        gps_           = dynamic_cast<webots::GPS*>(robot->getDevice("gps"));
+        inertial_unit_ = dynamic_cast<webots::InertialUnit*>(robot->getDevice("inertial unit"));
+        compass_       = dynamic_cast<webots::Compass*>(robot->getDevice("compass"));
 
         // Activa los componentes en la simulación si los detecta.
         // Heavy sensors run at sensor_period; the IMU and wheel encoders are cheap and
@@ -219,6 +244,13 @@ void SpecificWorker::initialize()
         }
         if(accelerometer) accelerometer->enable(compute_period);
         if(gyroscope) gyroscope->enable(compute_period);
+        if(inertial_unit_) inertial_unit_->enable(compute_period);
+        if(compass_) compass_->enable(compute_period);
+        if(gps_)
+        {
+            gps_->enable(std::max(gps_period_ms_, compute_period));
+            init_gps_reference();
+        }
         if (zedRangeFinder) zedRangeFinder->enable(sensor_period);
         if (zed) zed->enable(sensor_period);
 
@@ -235,7 +267,8 @@ void SpecificWorker::initialize()
                     break;
                 }
         std::cout << "Base: " << kinematics << " (" << wheel_count_ << " driven wheels, R="
-                  << wheel_radius_ << " m, half-track=" << half_track_ << " m)" << std::endl;
+                  << wheel_radius_ << " m, half-track=" << half_track_ << " m, track scale="
+                  << track_scale_ << ")" << std::endl;
         std::cout << "FullPose: " << velocity_source << "-derived velocity @ "
                   << (1000.0 / fullpose_publish_period_ms) << " Hz; IMU @ step rate ("
                   << (1000.0 / compute_period) << " Hz nominal)" << std::endl;
@@ -274,6 +307,7 @@ void SpecificWorker::compute()
     // Refresh the snapshots served by the RPC servants, then drain any work they
     // queued. Everything that talks to Webots happens on this thread.
     update_imu_data(now);
+    update_gps_data();
     update_object_poses();
     update_door_control();
     run_webots_tasks();
@@ -531,13 +565,23 @@ bool SpecificWorker::update_wheel_odometry(double sim_seconds, bool publishing)
 
         const double R = wheel_radius_, c = half_track_;
         double advz_fk, advx, rot;
-        if (base_kinematics_ == BaseKinematics::Differential)
+        if (base_kinematics_ == BaseKinematics::Skid)
+        {
+            // w[0],w[1] = left pair, w[2],w[3] = right pair; each side is the mean of its two
+            // encoders. Same model as the differential below, with the effective track.
+            const double wl = 0.5 * (w[0] + w[1]);
+            const double wr = 0.5 * (w[2] + w[3]);
+            advz_fk = R * 0.5 * (wr + wl);
+            advx    = 0.0;
+            rot     = R / (2.0 * c * track_scale_) * (wr - wl);
+        }
+        else if (base_kinematics_ == BaseKinematics::Differential)
         {
             // w[0] = left, w[1] = right. A differential base cannot translate sideways, so advx is
             // structurally zero here -- not measured-as-zero, but absent from the model.
             advz_fk = R * 0.5       * (w[1] + w[0]);
             advx    = 0.0;
-            rot     = R / (2.0 * c) * (w[1] - w[0]);
+            rot     = R / (2.0 * c * track_scale_) * (w[1] - w[0]);
         }
         else
         {
@@ -1541,7 +1585,7 @@ void SpecificWorker::apply_pending_speed_command()
 #endif
 
     double speeds[4] = {0, 0, 0, 0};
-    if (base_kinematics_ == BaseKinematics::Differential)
+    if (base_kinematics_ == BaseKinematics::Differential or base_kinematics_ == BaseKinematics::Skid)
     {
         // A differential base has no lateral degree of freedom, so advx is dropped rather than
         // silently folded into something else. Say so once: a caller commanding side motion is
@@ -1549,12 +1593,23 @@ void SpecificWorker::apply_pending_speed_command()
         // second.
         if (std::fabs(advx) > 1e-4 and not warned_advx_ignored_)
         {
-            std::cout << "setSpeedBase: advx=" << advx << " m/s ignored -- this base is differential "
+            std::cout << "setSpeedBase: advx=" << advx << " m/s ignored -- this base is differential/skid "
                       << "and cannot translate sideways." << std::endl;
             warned_advx_ignored_ = true;
         }
-        speeds[0] = (advz - half_track_ * cmd.rot) / wheel_radius_;   // wheel_left
-        speeds[1] = (advz + half_track_ * cmd.rot) / wheel_radius_;   // wheel_right
+        const double c_eff = half_track_ * track_scale_;
+        const double left  = (advz - c_eff * cmd.rot) / wheel_radius_;
+        const double right = (advz + c_eff * cmd.rot) / wheel_radius_;
+        if (base_kinematics_ == BaseKinematics::Skid)
+        {
+            speeds[0] = speeds[1] = left;    // front_left, rear_left
+            speeds[2] = speeds[3] = right;   // front_right, rear_right
+        }
+        else
+        {
+            speeds[0] = left;                // wheel_left
+            speeds[1] = right;               // wheel_right
+        }
     }
     else
     {
@@ -1957,7 +2012,16 @@ void SpecificWorker::update_imu_data(long timestamp)
                          diag_cov(gyro_var), timestamp, sim_ts, true};
         }
 
-    if (robotNode != nullptr)
+    if (inertial_unit_ != nullptr)
+    {
+        // A real attitude sensor (HuskyA300.proto), with its own noise: preferred over the supervisor.
+        // Yaw is about +Z from world +X (ENU east) when WorldInfo.northDirection is 0 1 0 -- the same
+        // angle rotationMatrixToEulerZYX returns below, so consumers see one convention either way.
+        if (const double *rpy = inertial_unit_->getRollPitchYaw(); rpy != nullptr and std::isfinite(rpy[0]))
+            data.rot = {(float)rpy[0], (float)rpy[1], (float)rpy[2], diag_cov(nominal_orient_var_),
+                        timestamp, sim_ts, true};
+    }
+    else if (robotNode != nullptr)
     {
         // Still the supervisor's orientation, standing in for the internal fusion a real IMU runs.
         // It is exact, hence "unknown" rather than a nominal variance -- claiming a number here would
@@ -1966,7 +2030,13 @@ void SpecificWorker::update_imu_data(long timestamp)
         data.rot = {roll, pitch, yaw, unknown_cov, timestamp, sim_ts, true};
     }
 
-    // Never populated by this bridge; say so rather than publishing a confident zero.
+    if (compass_ != nullptr)
+        if (const double *m = compass_->getValues(); m != nullptr and std::isfinite(m[0]))
+        {
+            // Webots' compass returns the unit NORTH vector in the device frame, not Tesla.
+            data.mag.XMag = (float)m[0]; data.mag.YMag = (float)m[1]; data.mag.ZMag = (float)m[2];
+        }
+    // Covariance unknown either way (the compass is exact); say so rather than a confident zero.
     data.mag.cov = unknown_cov;
     data.mag.timestamp = timestamp;
     data.mag.simTimestamp = sim_ts;
@@ -2001,9 +2071,9 @@ RoboCompIMU::DataImu SpecificWorker::IMU_getDataImu()
 
 RoboCompIMU::Magnetic SpecificWorker::IMU_getMagneticFields()
 {
-    RoboCompIMU::Magnetic ret{};
-    printNotImplementedWarningMessage(__FUNCTION__);
-    return ret;
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(imu_mutex);
+    return imu_data.mag;
 }
 
 RoboCompIMU::Orientation SpecificWorker::IMU_getOrientation()
@@ -2044,6 +2114,142 @@ void SpecificWorker::IMU_resetImu()
 }
 
 #pragma endregion IMU
+
+#pragma region GPS
+
+// WGS84 -> UTM (Snyder, "Map Projections: A Working Manual", eqs. 8-9 .. 8-10). Sub-millimetre
+// over a field. force_zone > 0 keeps a position in the reference's zone even across a boundary, so
+// the local frame never jumps by a zone width.
+void SpecificWorker::wgs84_to_utm(double lat_deg, double lon_deg, int force_zone,
+                                  int &zone, char &band, double &east, double &north)
+{
+    constexpr double a = 6378137.0, f = 1.0 / 298.257223563, k0 = 0.9996;
+    constexpr double e2 = f * (2.0 - f), ep2 = e2 / (1.0 - e2);
+    zone = force_zone > 0 ? force_zone : static_cast<int>(std::floor((lon_deg + 180.0) / 6.0)) + 1;
+    static const char *bands = "CDEFGHJKLMNPQRSTUVWXX";
+    band = (lat_deg >= -80.0 and lat_deg <= 84.0) ? bands[static_cast<int>((lat_deg + 80.0) / 8.0)] : 'Z';
+
+    const double lon0 = ((zone - 1) * 6 - 180 + 3) * M_PI / 180.0;
+    const double phi = lat_deg * M_PI / 180.0, lam = lon_deg * M_PI / 180.0;
+    const double s = std::sin(phi), c = std::cos(phi), t = std::tan(phi);
+    const double N = a / std::sqrt(1.0 - e2 * s * s);
+    const double T = t * t, C = ep2 * c * c, A = c * (lam - lon0);
+    const double M = a * ((1 - e2 / 4 - 3 * e2 * e2 / 64 - 5 * e2 * e2 * e2 / 256) * phi
+                        - (3 * e2 / 8 + 3 * e2 * e2 / 32 + 45 * e2 * e2 * e2 / 1024) * std::sin(2 * phi)
+                        + (15 * e2 * e2 / 256 + 45 * e2 * e2 * e2 / 1024) * std::sin(4 * phi)
+                        - (35 * e2 * e2 * e2 / 3072) * std::sin(6 * phi));
+    east  = k0 * N * (A + (1 - T + C) * std::pow(A, 3) / 6
+                      + (5 - 18 * T + T * T + 72 * C - 58 * ep2) * std::pow(A, 5) / 120) + 500000.0;
+    north = k0 * (M + N * t * (A * A / 2 + (5 - T + 9 * C + 4 * C * C) * std::pow(A, 4) / 24
+                               + (61 - 58 * T + T * T + 600 * C - 330 * ep2) * std::pow(A, 6) / 720));
+    if (lat_deg < 0) north += 10000000.0;
+}
+
+// The local origin is WorldInfo.gpsReference, so GPS_getPos() is the Webots world frame (x east,
+// y north with northDirection 0 1 0) and a GPS fix can be compared directly against the supervisor.
+void SpecificWorker::init_gps_reference()
+{
+    gps_wgs84_ = gps_ != nullptr and gps_->getCoordinateSystem() == webots::GPS::WGS84;
+    if (not gps_wgs84_)
+    {
+        std::cout << "[GPS] coordinate system is LOCAL: getPos() = Webots x,y,z, getData()/getUTMData() "
+                  << "report no fix. Set WorldInfo.gpsCoordinateSystem \"WGS84\" for lat/lon." << std::endl;
+        return;
+    }
+    double ref[3] = {0, 0, 0};
+    if (webots::Node *root = robot->getRoot(); root != nullptr)
+        if (webots::Field *children = root->getField("children"); children != nullptr)
+            for (int i = 0; i < children->getCount(); ++i)
+                if (webots::Node *n = children->getMFNode(i); n != nullptr and n->getTypeName() == "WorldInfo")
+                {
+                    if (webots::Field *r = n->getField("gpsReference"); r != nullptr)
+                        if (const double *v = r->getSFVec3f(); v != nullptr)
+                            std::copy(v, v + 3, ref);
+                    break;
+                }
+    char band;
+    wgs84_to_utm(ref[0], ref[1], 0, gps_origin_zone_, band, gps_origin_east_, gps_origin_north_);
+    gps_origin_alt_ = ref[2];
+    gps_origin_set_ = true;
+    std::printf("[GPS] WGS84, reference %.7f %.7f %.2f m -> UTM %d%c E %.3f N %.3f (local origin)\n",
+                ref[0], ref[1], ref[2], gps_origin_zone_, band, gps_origin_east_, gps_origin_north_);
+}
+
+// Runs in the compute() thread. Webots refreshes the GPS once per its sampling period; between
+// samples getValues() repeats the last one, which is exactly what a real receiver's driver does.
+void SpecificWorker::update_gps_data()
+{
+    if (gps_ == nullptr) return;
+    const double *v = gps_->getValues();
+    if (v == nullptr or not std::isfinite(v[0])) return;
+
+    GpsState st;
+    if (gps_wgs84_)
+    {
+        st.lat = v[0]; st.lon = v[1]; st.alt = v[2];
+        wgs84_to_utm(st.lat, st.lon, gps_origin_zone_, st.zone, st.band, st.east, st.north);
+        if (gps_reset_requested_.exchange(false))
+        {
+            gps_origin_east_ = st.east; gps_origin_north_ = st.north; gps_origin_alt_ = st.alt;
+            std::printf("[GPS] resetPos: local origin moved to E %.3f N %.3f\n", st.east, st.north);
+        }
+        st.x = st.east - gps_origin_east_;
+        st.y = st.north - gps_origin_north_;
+        st.z = st.alt - gps_origin_alt_;
+    }
+    else
+    {
+        st.x = v[0]; st.y = v[1]; st.z = v[2];
+        if (gps_reset_requested_.exchange(false))
+        {
+            gps_origin_east_ = st.x; gps_origin_north_ = st.y; gps_origin_alt_ = st.z;
+            gps_origin_set_ = true;
+        }
+        if (gps_origin_set_) { st.x -= gps_origin_east_; st.y -= gps_origin_north_; st.z -= gps_origin_alt_; }
+    }
+    st.valid = true;
+    const std::lock_guard<std::mutex> lock(gps_mutex_);
+    gps_state_ = st;
+}
+
+bool SpecificWorker::GPS_getData(float &latitude, float &longitude, float &altitude)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(gps_mutex_);
+    latitude  = static_cast<float>(gps_state_.lat);
+    longitude = static_cast<float>(gps_state_.lon);
+    altitude  = static_cast<float>(gps_state_.alt);
+    return gps_state_.valid and gps_wgs84_;
+}
+
+bool SpecificWorker::GPS_getPos(float &x, float &y, float &z)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(gps_mutex_);
+    x = static_cast<float>(gps_state_.x);
+    y = static_cast<float>(gps_state_.y);
+    z = static_cast<float>(gps_state_.z);
+    return gps_state_.valid;
+}
+
+bool SpecificWorker::GPS_getUTMData(int &xzone, std::string &yzone, double &eastering, double &northing)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(gps_mutex_);
+    xzone = gps_state_.zone;
+    yzone = std::string(1, gps_state_.band);
+    eastering = gps_state_.east;
+    northing  = gps_state_.north;
+    return gps_state_.valid and gps_wgs84_;
+}
+
+void SpecificWorker::GPS_resetPos()
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    gps_reset_requested_ = true;   // applied by the compute thread on the next GPS update
+}
+
+#pragma endregion GPS
 
 void SpecificWorker::printNotImplementedWarningMessage(std::string functionName)
 {

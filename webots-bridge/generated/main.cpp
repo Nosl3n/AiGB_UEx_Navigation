@@ -81,6 +81,7 @@
 #include <camerargbdsimpleI.h>
 #include <doorcontrolI.h>
 #include <imuI.h>
+#include <gpsI.h>
 #include <laserI.h>
 #include <lidar3dI.h>
 #include <omnirobotI.h>
@@ -96,6 +97,7 @@
 #include <GenericBase.h>
 #include <Gridder.h>
 #include <IMU.h>
+#include <GPS.h>
 #include <JoystickAdapter.h>
 #include <KinovaArm.h>
 #include <Laser.h>
@@ -350,6 +352,16 @@ int Webots2Robocomp::run(int argc, char* argv[])
 		implement<IMUI>(communicator(),
 		                    configLoader.get<std::string>("Endpoints.IMU"), 
 		                    "imu", worker,  0);
+		// Added by hand (not robocompdsl output), like DoorControl. OPTIONAL: a config without
+		// Endpoints.GPS (every Shadow one) simply does not serve it.
+		{
+			std::string gpsEndpoint;
+			try { gpsEndpoint = configLoader.get<std::string>("Endpoints.GPS"); } catch(...) {}
+			if (not gpsEndpoint.empty())
+				implement<GPSI>(communicator(), gpsEndpoint, "gps", worker,  0);
+			else
+				std::cout << "[" << PROGRAM_NAME << "]: no Endpoints.GPS in config, GPS interface not served" << std::endl;
+		}
 		implement<LaserI>(communicator(),
 		                    configLoader.get<std::string>("Endpoints.Laser"), 
 		                    "laser", worker,  0);

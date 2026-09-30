@@ -41,6 +41,7 @@
 #include <GenericBase.h>
 #include <Gridder.h>
 #include <IMU.h>
+#include <GPS.h>
 #include <JoystickAdapter.h>
 #include <KinovaArm.h>
 #include <Laser.h>
@@ -91,6 +92,11 @@ public:
 	virtual RoboCompIMU::Magnetic IMU_getMagneticFields() = 0;
 	virtual RoboCompIMU::Orientation IMU_getOrientation() = 0;
 	virtual void IMU_resetImu() = 0;
+
+	virtual bool GPS_getData(float &latitude, float &longitude, float &altitude) = 0;
+	virtual bool GPS_getPos(float &x, float &y, float &z) = 0;
+	virtual bool GPS_getUTMData(int &xzone, std::string &yzone, double &eastering, double &northing) = 0;
+	virtual void GPS_resetPos() = 0;
 
 	virtual RoboCompLaser::TLaserData Laser_getLaserAndBStateData(RoboCompGenericBase::TBaseState &bState) = 0;
 	virtual RoboCompLaser::LaserConfData Laser_getLaserConfData() = 0;

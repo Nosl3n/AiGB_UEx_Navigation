@@ -73,12 +73,14 @@ bool MeshFilter::init(const Config& cfg)
         placement(1, 3) = cfg.mesh_off_y;
         placement(2, 3) = cfg.mesh_off_z;
 
-        if (cfg.robot_name == "Shadow")
-            loaded = m_loader->loadSingleMesh(cfg.mesh_dir + "/" + cfg.mesh_file, placement);
-        else if (cfg.robot_name == "P3Bot")
+        // P3Bot is a URDF; every other robot (Shadow, HuskyA300, ...) is one static mesh in the
+        // robot frame, metres, named by MeshFilter.mesh_file relative to mesh_dir.
+        if (cfg.robot_name == "P3Bot")
             loaded = m_loader->loadURDF(cfg.mesh_dir + "/P3Bot/P3Bot.urdf", cfg.mesh_dir + "/P3Bot/");
+        else if (not cfg.mesh_file.empty())
+            loaded = m_loader->loadSingleMesh(cfg.mesh_dir + "/" + cfg.mesh_file, placement);
         else
-            std::cerr << "[MeshFilter] unknown Robot.name '" << cfg.robot_name << "'" << std::endl;
+            std::cerr << "[MeshFilter] Robot.name '" << cfg.robot_name << "' has no MeshFilter.mesh_file" << std::endl;
         if (loaded)
             std::printf("[MeshFilter] mesh='%s' offset(%.4f,%.4f,%.4f)\n",
                         cfg.mesh_file.c_str(), cfg.mesh_off_x, cfg.mesh_off_y, cfg.mesh_off_z);

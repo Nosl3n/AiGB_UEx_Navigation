@@ -64,7 +64,9 @@ SpecificWorker::~SpecificWorker()
 {
 	std::cout << "Destroying SpecificWorker" << std::endl;
     running = false;
+#ifdef HAVE_ZED_SDK
     zed.close();
+#endif
 }
 
 void SpecificWorker::initialize()
@@ -182,6 +184,14 @@ void SpecificWorker::initialize()
 
 
 
+#ifndef HAVE_ZED_SDK
+    if (!simulated)
+    {
+        std::cerr << "zed_camera was built WITHOUT the ZED SDK: only Config.Simulated = true is "
+                     "supported. Install the SDK and rebuild to use a real camera." << std::endl;
+        std::exit(1);
+    }
+#else
     if (!simulated)
     {
         // INIT PARAMETERS
@@ -237,6 +247,7 @@ void SpecificWorker::initialize()
     //IMU, barometer and magnetometer
     // sensor_thread = std::thread(&SpecificWorker::sensorsLoop, this);
     }
+#endif
     qInfo() << "Initialization completed for SpecificWorker";
 }
 
@@ -315,6 +326,7 @@ void SpecificWorker::regulate_period()
 // ---- Real ZED branch: grab, build the frame, publish/store, then pose. ----
 void SpecificWorker::step_real()
 {
+#ifdef HAVE_ZED_SDK
     if (zed.grab() != sl::ERROR_CODE::SUCCESS)   // no new frame this tick
         return;
 
@@ -323,6 +335,7 @@ void SpecificWorker::step_real()
     const long num_points = build_real_rgbd(rgbd, colorCloud);
     publish_and_store(std::move(rgbd), colorCloud, num_points);
     process_pose_data();
+#endif
 }
 
 // ---- Simulated branch: pull from the CameraRGBDSimple proxy, reproject depth. ----
@@ -369,6 +382,7 @@ void SpecificWorker::store_rgbd(RoboCompCameraRGBDSimple::TRGBD &&rgbd)
 
 ///////////////////////////////////////////////////////////////////////
 
+#ifdef HAVE_ZED_SDK
 // Acquire from the real ZED camera and build the RGBD frame (+ optional color cloud).
 // RGB is converted RGBA->RGB straight INTO the Ice byte buffer and depth is memcpy'd
 // straight in — no intermediate cv::Mat/vector copies. Returns the valid point count.
@@ -460,6 +474,8 @@ long SpecificWorker::build_real_rgbd(RoboCompCameraRGBDSimple::TRGBD &rgbd,
     rgbd.points.points = std::move(cloud);
     return index;
 }
+
+#endif
 
 // Pull one frame from the simulated CameraRGBDSimple proxy (Webots) and reproject its
 // depth into a point cloud. The source image/depth buffers are MOVED into the frame
@@ -643,6 +659,7 @@ void SpecificWorker::show_frames()
 
 void SpecificWorker::process_pose_data()
 {
+#ifdef HAVE_ZED_SDK
     static long last_timestamp = 0;
 
 
@@ -723,10 +740,12 @@ void SpecificWorker::process_pose_data()
         // "| RX:"<< pose.rx << "|RY:"<<pose.ry<< "|RZ:"<< pose.rz<<"| VX:"<<pose.vx<<"|VY:"<<pose.vy<<"|VZ:"<< pose.vz<<
         // "| VRX:"<< pose.vrx << "|VRY:"<<pose.vry<< "|VRZ:"<< pose.vrz<<"| Time:"<<pose.timestamp<<"              ";    
 
+#endif
 }
 
 void SpecificWorker::sensorsLoop()
 {
+#ifdef HAVE_ZED_SDK
     const int N = 16;                   // Downsampling factor (publicarás a 100 Hz si N=4)
     int sample_count = 0;
     // Acumuladores para aceleración y giro
@@ -805,6 +824,7 @@ void SpecificWorker::sensorsLoop()
 //        std::cout << "Sleeping for: " << 2500 - elapsed << " microseconds" << std::endl;
         std::this_thread::sleep_for(std::chrono::microseconds(2500 - elapsed));
     }
+#endif
 }
 
 float SpecificWorker::wrapToPi(float angle_rad) {
@@ -815,10 +835,12 @@ float SpecificWorker::wrapToPi(float angle_rad) {
 }
 
 //**************************************/AUX/**************************************/
+#ifdef HAVE_ZED_SDK
 void SpecificWorker::transformPose(sl::Transform &pose, sl::Transform transform) {
     // Pose(new reference frame) = Pose (camera frame) * M, where M is the transform between two frames
     pose = pose * transform;
 }
+#endif
 
 void SpecificWorker::emergency()
 {

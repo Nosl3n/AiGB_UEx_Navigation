@@ -51,30 +51,35 @@ if(OpenMP_CXX_FOUND)
     LIST(APPEND LIBS ${LIBS} OpenMP::OpenMP_CXX)
 endif()
 
-option(LINK_SHARED_ZED "Link with the ZED SDK shared executable" ON)
+# The ZED SDK (+ CUDA) is only needed for a REAL camera. Without it the component still builds, in
+# simulation-only mode (Config.Simulated = true: frames come from Webots via CameraRGBDSimple).
+find_package(ZED 3 QUIET)
+if (ZED_FOUND)
+    option(LINK_SHARED_ZED "Link with the ZED SDK shared executable" ON)
 
-if (NOT LINK_SHARED_ZED AND MSVC)
-    message(FATAL_ERROR "LINK_SHARED_ZED OFF : ZED SDK static libraries not available on Windows")
-endif()
+    if (NOT LINK_SHARED_ZED AND MSVC)
+        message(FATAL_ERROR "LINK_SHARED_ZED OFF : ZED SDK static libraries not available on Windows")
+    endif()
 
-find_package(ZED 3 REQUIRED)
-find_package(CUDA ${ZED_CUDA_VERSION} REQUIRED)
-find_package(OpenMP REQUIRED)
+    find_package(CUDA ${ZED_CUDA_VERSION} REQUIRED)
 
+    include_directories(${CUDA_INCLUDE_DIRS})
+    include_directories(${ZED_INCLUDE_DIRS})
 
-include_directories(${CUDA_INCLUDE_DIRS})
-include_directories(${ZED_INCLUDE_DIRS})
+    link_directories(${ZED_LIBRARY_DIR})
+    link_directories(${CUDA_LIBRARY_DIRS})
 
-link_directories(${ZED_LIBRARY_DIR})
-link_directories(${CUDA_LIBRARY_DIRS})
+    if (LINK_SHARED_ZED)
+        SET(ZED_LIBS ${ZED_LIBRARIES} ${CUDA_CUDA_LIBRARY} ${CUDA_CUDART_LIBRARY})
+    else()
+        SET(ZED_LIBS ${ZED_STATIC_LIBRARIES} ${CUDA_CUDA_LIBRARY} ${CUDA_LIBRARY})
+    endif()
 
-if (LINK_SHARED_ZED)
-    SET(ZED_LIBS ${ZED_LIBRARIES} ${CUDA_CUDA_LIBRARY} ${CUDA_CUDART_LIBRARY})
+    LIST(APPEND LIBS ${LIBS} ${ZED_LIBS} )
+    add_definitions(-DHAVE_ZED_SDK)
 else()
-    SET(ZED_LIBS ${ZED_STATIC_LIBRARIES} ${CUDA_CUDA_LIBRARY} ${CUDA_LIBRARY})
+    message(WARNING "ZED SDK not found: building zed_camera in SIMULATION-ONLY mode (Config.Simulated = true)")
 endif()
-
-LIST(APPEND LIBS ${LIBS} ${ZED_LIBS} )
 
 # FastDDS for the standalone media plane (rc::media). Imported targets carry their
 # own include dirs, so no extra include_directories() is needed for FastDDS itself.

@@ -1,6 +1,6 @@
 
 # This property is used by the clients to connect to IceStorm.
-Proxies.TopicManager = "IceStorm/TopicManager:default -p 1237"
+Proxies.TopicManager = "IceStorm/TopicManager:default -p 9999"
 
 # Proxies for publishes interfaces
 Proxies.JoystickAdapterPrefix = ""
