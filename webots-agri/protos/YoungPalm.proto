@@ -1,0 +1,122 @@
+#VRML_SIM R2025a utf8
+# license: Apache License 2.0
+# template language: javascript
+# A young palm sized for a Husky A300 to drive between rows (plan.md, F3).
+#
+# Webots' own PalmTree is ~4.8 m tall with a 2.7 m frond radius and no size field, far too big for a
+# nursery row. This one is procedural: a trunk plus N fronds in one IndexedFaceSet (cheap to render),
+# each frond a tapering leaf that rises from the crown and droops towards its tip. `seed` varies the
+# frond layout per instance deterministically, so a generated field looks natural but re-loads identical.
+#
+# COLLISION = THE TRUNK ONLY. The fronds are visible to the camera and the LiDAR (Webots ray-casts the
+# graphics), but the robot may brush through them, as it would through real leaves. The default crown
+# radius (~0.6 m; crown top ~0.95 m, frond tips ~0.8 m) is what the row spacing in webots-agri/tools/gen_palm_rows.py is computed against.
+
+PROTO YoungPalm [
+  field SFVec3f    translation   0 0 0
+  field SFRotation rotation      0 0 1 0
+  field SFString   name          "young palm"
+  field SFInt32    seed          1          # per-instance frond variation (deterministic)
+  field SFFloat    trunkHeight   0.7        # m, ground to crown
+  field SFFloat    trunkRadius   0.07       # m
+  field SFInt32    frondCount    9
+  field SFFloat    frondLength   0.6        # m, along the frond
+  field SFFloat    frondWidth    0.16       # m, at its widest
+  field SFFloat    frondRise     0.9        # rad, initial elevation of a frond above horizontal
+  field SFFloat    frondDroop    1.8        # 1/m, curvature pulling the tip down
+  field SFColor    frondColor    0.18 0.42 0.12
+  field SFColor    trunkColor    0.42 0.31 0.2
+]
+{
+%<
+  import * as wbrandom from 'wbrandom.js';
+  wbrandom.seed(fields.seed.value);
+  const H = fields.trunkHeight.value;
+  const N = fields.frondCount.value;
+  const L = fields.frondLength.value;
+  const W = fields.frondWidth.value;
+  const rise = fields.frondRise.value;
+  const droop = fields.frondDroop.value;
+  const SEG = 6;                       // segments along each frond
+  const points = [];
+  const faces = [];
+  for (let i = 0; i < N; ++i) {
+    const az = 2 * Math.PI * i / N + wbrandom.real(-0.25, 0.25);
+    const len = L * wbrandom.real(0.8, 1.15);
+    const el = rise * wbrandom.real(0.7, 1.2);
+    const k = droop * wbrandom.real(0.8, 1.25);
+    const ca = Math.cos(az), sa = Math.sin(az);
+    const base = points.length;
+    for (let j = 0; j <= SEG; ++j) {
+      const s = j / SEG;
+      const r = len * s;
+      const z = H + r * Math.tan(el) - k * r * r;
+      const hw = 0.5 * W * Math.pow(Math.sin(Math.PI * Math.min(s + 0.08, 1.0)), 0.7);
+      points.push([r * ca - hw * sa, r * sa + hw * ca, z]);   // left edge
+      points.push([r * ca + hw * sa, r * sa - hw * ca, z]);   // right edge
+    }
+    for (let j = 0; j < SEG; ++j) {
+      const a = base + 2 * j, b = a + 1, c = a + 2, d = a + 3;
+      // Both windings: Webots culls back faces and IndexedFaceSet has no `solid` field.
+      faces.push([a, b, d], [a, d, c], [a, d, b], [a, c, d]);
+    }
+  }
+>%
+  Solid {
+    translation IS translation
+    rotation IS rotation
+    name IS name
+    model "young palm"
+    recognitionColors [ %<= fields.frondColor.value.r >% %<= fields.frondColor.value.g >% %<= fields.frondColor.value.b >% ]
+    children [
+      Pose {
+        translation 0 0 %<= H / 2 >%
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor IS trunkColor
+              roughness 1
+              metalness 0
+            }
+            geometry Cylinder {
+              height %<= H + 0.04 >%
+              radius IS trunkRadius
+              subdivision 12
+            }
+          }
+        ]
+      }
+      Shape {
+        appearance PBRAppearance {
+          baseColor IS frondColor
+          roughness 0.9
+          metalness 0
+        }
+        geometry IndexedFaceSet {
+          coord Coordinate {
+            point [
+%< for (const p of points) { >%
+              %<= p[0].toFixed(4) >% %<= p[1].toFixed(4) >% %<= p[2].toFixed(4) >%
+%< } >%
+            ]
+          }
+          coordIndex [
+%< for (const f of faces) { >%
+            %<= f[0] >% %<= f[1] >% %<= f[2] >% -1
+%< } >%
+          ]
+          creaseAngle 0.8
+        }
+      }
+    ]
+    boundingObject Pose {
+      translation 0 0 %<= H / 2 >%
+      children [
+        Cylinder {
+          height %<= H >%
+          radius IS trunkRadius
+        }
+      ]
+    }
+  }
+}

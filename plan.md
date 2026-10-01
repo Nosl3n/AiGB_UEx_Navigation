@@ -120,9 +120,10 @@ Todo esto debe quedar como parámetros del generador del mundo.
 | F0 | pendiente (`WORLD/` sigue en su sitio; `webots-agri/` ya creado) |
 | F1 | ✅ hecho (falta confirmar medidas con el URDF del A300) |
 | F2 | ✅ hecho (incluido `husky.json` y `robot_concept` para el Husky) |
-| F3 | pendiente |
+| F3 | 🟡 hileras de palmeras en `husky_test.wbt` (falta el generador de mundo completo y otros cultivos) |
 | F4 | ✅ `openfield_concept` funcionando (falta afinar covarianza y conectar controller/residual en F5) |
-| F5–F7 | pendiente |
+| F5 | 🟡 navegación autónoma por las hileras funcionando (falta robustez: giro lento del skid-steer, suelo irregular) |
+| F6–F7 | pendiente |
 
 ### F1 — hecho (2026-09-30)
 - `webots-agri/protos/HuskyA300.proto`: skid-steer de 4 ruedas (`front_left`, `rear_left`,
@@ -207,3 +208,138 @@ Todo esto debe quedar como parámetros del generador del mundo.
 - El interfaz `RoboCompGPS` no lleva marca de tiempo: cada fix se aplica al recibirlo (≤ 50 ms de
   sondeo + 100 ms de periodo del receptor). Suficiente a 1 m/s con RTK; revisar si se sube la velocidad.
 - Conectar `controller` y `residual_concept` (`required_agent_names` → `openfield_concept`), F5.
+
+### F3 — primeras hileras (2026-10-01)
+- `webots-agri/protos/YoungPalm.proto`: palmera joven procedural (tronco 0,7 m, copa ~0,95 m de alto
+  y ~0,6 m de radio, `seed` para variar las hojas). Colisión solo en el tronco; las hojas las ven la
+  cámara y el LiDAR. El `PalmTree` de Webots (4,8 m, sin campo de tamaño) no servía.
+- `webots-agri/tools/gen_palm_rows.py`: escribe las hileras en el mundo entre marcadores
+  `PALM_ROWS`, con la separación derivada del Husky. Por defecto 5 hileras × 10 palmeras, 2,5 m entre
+  hileras (pasillo libre 1,3 m para 0,69 m de robot), 1,5 m entre palmeras, ±5 cm de error de
+  plantación. Hileras en x = −5, −2,5, 0, 2,5, 5; pasillos en x = ±1,25, ±3,75; y = −6,75 … 6,75.
+- `husky_test.wbt`: quitadas las cajas; el Husky arranca en la cabecera sur (1,25, −10,5) mirando al
+  norte, alineado con un pasillo.
+
+### F5 — controller + residual sobre el nodo `field` (2026-10-01)
+- **cortex**: nuevo tipo de nodo `field` (`dsr_node_type.h`), instalado. El mundo exterior ya no es
+  `room`: `openfield_concept` publica el nodo `field` y la arista `husky → field`.
+- `common/world_frame/world_frame.h`: `rc::world::frame_node / FrameCache` — busca `field` y si no `room`.
+  controller y residual lo usan en lugar del literal `"room"` (el Shadow sigue funcionando igual).
+- Configs del Husky: `controller/etc/config_husky.toml` (requiere `openfield_concept`,
+  `RobotMeshYawDeg = 0`, `Target.EdgeType = "goto_action"`, `ArmOnStart`) y
+  `residual_concept/etc/config_husky.toml` (requiere `openfield_concept`, `UseBpearl = false`).
+  `utils/cognitive_husky.toml` lanza robot_concept → openfield_concept → residual → controller.
+- `utils/send_goal.py X Y`: objetivo por el grafo (nodo `goal` bajo `field`, arista `goto_action`).
+- controller: opción `Controller.ArmOnStart` (por defecto false) = pulsar Run al arrancar.
+- Hallazgos: el tipo de arista `target` que el controller usaba por defecto **no existe en cortex**
+  (por eso `goto_action`); el controller **no conduce hasta pulsar Run** (o clic, o `ArmOnStart`).
+- **Primera prueba autónoma**: objetivo (1,25, 9,5) desde (1,25, −10,5). El robot planificó, giró y
+  recorrió ~13 m por el pasillo x = −3,75 con la localización a ≤ 8,5 cm, y se detuvo en (−3,84, 2,75).
+
+### F5 — auto-retornos resueltos (2026-10-01)
+- **Bug real en `residual_zed_boost.cpp` (`voxel_downsample`)**: `cells[key]` creaba un
+  `Eigen::Vector3f` SIN inicializar y sumaba sobre basura → puntos de la ZED a 30 m, detrás de la
+  cámara y con valores de 1e31 → la mayoría de las celdas falsas (incl. las "fantasma" detrás del robot).
+  Corregido con `try_emplace(..., Zero(), 0)`. Afecta también al Shadow.
+- **Filtro con la forma del robot** en residual (`Grid.SelfBodyShape = "robot"`, solo en
+  `config_husky.toml`): caja orientada = huella medida del mesh (body `width_m`/`depth_m`) + margen,
+  centrada en el ROBOT (no en el LiDAR, que en el Husky está 25 cm detrás). Aplicado en la rejilla de
+  ocupación y en el clustering. Elimina los impactos del helios sobre la ZED.
+- residual: volcado opcional de los puntos de la ZED (`ZedBoost.DumpCsvPath`, vacío por defecto).
+- Resultado (robot parado en la salida): celdas a < 1,2 m del robot 84 → 1; celdas fantasma detrás 90 → 0;
+  celdas totales 2389 → 1143.
+- **Prueba autónoma**: objetivo (1,25, 9,5) desde (1,25, −10,5) → **alcanzado** en (1,10, 9,50), cruzando
+  la parcela por el pasillo x ≈ 3,7.
+
+### Pendiente de F5
+- 1 celda persistente a 0,28 m delante del parachoques (z 0,91) sin puntos que la expliquen (ni helios
+  ni ZED caen ahí con altura): artefacto de integración de la rejilla, por investigar.
+- "SPINNING" al girar despacio en el sitio (ordenó 0,9 rad, giró 0,02): el skid-steer no vence el
+  arrastre a velocidades de giro bajas; revisar par de motores / velocidad mínima de giro.
+- Eligió el pasillo x = 3,75 en vez del de enfrente; revisar el coste de holgura del planificador.
+- Suelo irregular (Farm.wbt): ver el resumen de literatura (segmentación local de suelo, mapas de
+  elevación, compensación de inclinación con la IMU).
+
+### Pendiente de F5 (histórico, ya resuelto arriba)
+- **Auto-retornos del Husky en residual**: celdas a 0,35–0,40 m delante del centro (la ZED y su
+  soporte, z 0,47–0,59 m) y en el borde de la placa (z 0,37 m). El planificador ve al robot dentro de un
+  obstáculo ("start was NOT footprint-feasible") y no encuentra ruta. Causas a revisar: (a) residual
+  centra el disco del propio cuerpo en el ORIGEN DEL LIDAR, que en el Husky está 25 cm detrás del
+  centro (en el Shadow coincide con el eje); (b) si el filtro por mesh de `lidar3d_dds` se aplica a la
+  nube que llega por DDS.
+- **Celdas fantasma** a 1–1,6 m de altura ~2 m detrás del robot, simétricas a ambos lados, sin nada en
+  el mundo: revisar la reconstrucción de la nube del helios (capas/elevaciones) en el bridge/driver.
+- Un atasco ("WEDGE") sin troncos cerca: revisar tras corregir lo anterior.
+- Por qué eligió el pasillo x = −3,75 y no el de enfrente (probablemente por las celdas falsas).
+
+### F5 — filtrado de campo, ruido del LiDAR y CPU del driver (2026-10-01)
+- **residual, ajuste de campo** (`config_husky.toml`, claves marcadas `FIELD (Husky)`): banda de suelo
+  0,25 m (ZED y helios), altura mínima 0,30 m, `DbscanMinPts` 10, `MinClusterPts` 30, manchas sueltas
+  `SpeckleMinNeighbours` 2 / `SpeckleMinComponentCells` 12. En `husky_test.wbt` (llano y limpio) el
+  efecto es pequeño (celdas "fantasma" 14 → 12 por ciclo); se notará con hierba y terreno irregular.
+- Las "fantasma" restantes son casi todas puntas de hojas desplazadas ~0,2 m al moverse (desfase
+  escaneo/pose), no ruido; más 1 punto persistente sin explicar a 0,79 m delante del robot (z 0,89).
+- **Ruido del LiDAR en Webots**: el campo `noise` del Lidar es RELATIVO a `maxRange`. El `0.005`
+  heredado del Shadow era σ = 15 cm en el Husky (y σ = 50 cm en el Shadow, maxRange 100). Ahora el
+  PROTO tiene `heliosNoiseM` (0,02 m, como el RS-Helios) e `imuNoiseRad` (0,003 rad; el `noise` del
+  InertialUnit es relativo a π/2). Bridge: `IMU.NominalOrientVar` = 9e-6.
+- **CPU de `lidar3d_dds`**: ~72 hilos (OpenMP + TBB/Embree, uno por núcleo cada uno) y ~1200 % de
+  CPU a 17 Hz, casi todo **espera activa de libgomp** entre escaneos (medido con muestreo de pilas).
+  Arreglo: `Threads.Count = 4` (OpenMP + Embree, `config_helios_husky_webots.toml`) y
+  `OMP_WAIT_POLICY=PASSIVE` en `sub_husky.toml`. Resultado: 23 hilos, **17 % de CPU a 17 Hz**, RSS
+  estable ~97 MB (no había fuga de memoria; los ~2 GB de VSZ son reservas de pila de los hilos).
+- Pendiente (menor): el driver pide la nube entera por Ice ~4 veces por escaneo y descarta las
+  repetidas (~1,2 MB por llamada); se podría pedir solo cuando cambie el timestamp.
+
+### F4 (cont.) — ventana de localización de `openfield_concept` (2026-10-01)
+- `src/openfield_viewer.{h,cpp}`: mapa 2D (trayectoria estimada azul/roja según el GPS, real verde, fixes
+  GPS naranja, robot con rumbo y elipse 2σ, polígono del campo; rueda = zoom), gráfica de error real
+  frente a 2σ estimada (últimos 3 min, sombreado cuando el GPS está apagado) y panel con pose, GPS,
+  odometría, IMU y error frente a la GT.
+- Casillas **GPS** y **yaw absoluto de la IMU**: dejan de fusionar esa medida (la predicción sigue), para
+  ver la deriva del dead reckoning. `Viewer.Enabled = true` en `etc/config.toml`.
+- Gancho de prueba por entorno (desactivado por defecto): `OPENFIELD_TEST_GPS_OFF=<s>`,
+  `OPENFIELD_TEST_GPS_ON=<s>`, `OPENFIELD_SNAPSHOT=<png>`.
+- Prueba: GPS apagado a los 20 s y encendido a los 55 s. En recta el error sin GPS apenas crece (2 cm);
+  tras un giro en el sitio 11 cm (patinaje); al quedar atascado contra una hilera con las ruedas
+  girando, 4 m. Al volver el GPS, a 4 cm en ~1 s.
+- **Hallazgo**: sin GPS la σ estimada (~9 cm) es muy inferior al error real cuando las ruedas patinan
+  (atasco): el modelo de ruido de la odometría no contempla el deslizamiento. Pendiente: detectar el
+  patinaje (ruedas frente a giroscopio/acelerómetro) y aumentar la varianza en consecuencia.
+- Pendiente (no causado por estos cambios): `robot_concept` aborta al cerrarse con SIGINT
+  ("pure virtual method called" tras "Destroying SpecificWorker").
+
+### F6 — personas: vida corta + LiDAR como "segunda mirada" (2026-10-01)
+
+- `human_concept` ya no borraba nunca: el contador de ausencia solo avanzaba con datos frescos (35 nodos para 2
+  trabajadores). Ahora cada persona tiene una creencia de existencia (`common/existence_belief`): un esqueleto
+  nuevo suma a favor; el helios talla una caja de torso (banda z 1,20–1,85 m, por encima de las copas de las
+  palmeras): retornos dentro = a favor, rayos que la atraviesan = en contra (ponderados por la incertidumbre de
+  posición), ningún rayo = sin evidencia. Se borra con P(existe) < 0,2, o tras `DeathTimeoutS` = 2 s sin evidencia
+  de ninguno de los dos sensores.
+- Seguimiento LiDAR (`src/human_lidar_presence.{h,cpp}`): cuando la ZED no ve a la persona, los retornos de la
+  banda dentro de su puerta (r + 2σ; σ = cámara k·d², LiDAR 5 cm, + giro del robot × latencia × d, + marcha × dt)
+  la re-centran y refrescan la pista de identidad, así el siguiente esqueleto vuelve al MISMO id.
+- Esqueletos duplicados (a < 0,5 m de otro del mismo frame) se descartan en vez de nacer como persona nueva.
+- `common/lidar_ingestor` y `common/nbv/graph_obstacles.h` usan ya el marco del mundo (`field` fuera, `room` dentro).
+- Prueba (robot quieto 30 s, gira de espaldas 20 s, vuelve, 20 s): `person_0` conserva su identidad los 80 s,
+  seguida por el LiDAR mientras camina de y = −3,8 a 2,9 sin cámara. Antes: un id nuevo cada pocos segundos.
+- Traza por barrido: `HUMAN_LIDAR_TRACE=1`. Medido: puntos en banda vs distancia 7 m 14 · 9 m 6 · 11–13 m ~2
+  (hueco entre anillos del helios) · 13–14 m 6.
+
+### Pendiente de F6
+
+- Nacimientos falsos de 1–2 ajustes al empezar/terminar un giro: la cámara proyecta mal durante la rotación
+  (mueren en 2 s). Siguiente: nacimiento con `common/instance_tracker` (varias observaciones antes de crear el nodo).
+- Trabajador agachado: queda por debajo de la banda; el LiDAR no opina (solo cámara + 2 s).
+- Deriva del ajuste del esqueleto a distancia; huella física (`width_m`/`depth_m`) para que el controller trate a
+  la persona como al resto de obstáculos; residual cediendo los puntos de la persona.
+
+### F3 (cont.) — `husky_field.wbt`: suelo de campo (2026-10-01)
+
+- Nuevo mundo `webots-agri/worlds/husky_field.wbt`: mismo trazado que `husky_test` sobre
+  `protos/FieldTerrain.proto` (ElevationGrid 36×36 m a 0,1 m): camellones de 0,20 m bajo cada hilera, pasillos y
+  cabeceras a z ≈ 0, ondulación ±4 cm, terrones ±1,2 cm, textura `Soil` marrón. Palmeras a z 0,14
+  (`gen_palm_rows.py --z`). Autotest OK (carga, sensores, conducción); `husky_test.wbt` sin cambios.
+- Consecuencias para el stack (suelo plano supuesto en EKF, residual y banda de personas):
+  ver `cosas_a_tener_en_cuenta.md` §3, §5 y §6.

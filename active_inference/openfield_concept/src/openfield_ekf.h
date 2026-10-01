@@ -3,7 +3,7 @@
 // PURE Eigen: no DSR, no Qt, no Ice, so it can be unit-tested in isolation (self_test()).
 //
 // ── FRAMES (the ones every agent here uses; see active_inference/FRAMES.md) ─────────────────────
-//   * Field frame ("room" node): x = EAST, y = NORTH, metres, origin = WorldInfo.gpsReference. It is
+//   * Field frame ("field" node): x = EAST, y = NORTH, metres, origin = WorldInfo.gpsReference. It is
 //     the GPS local frame the bridge serves (GPS.getPos), and in simulation also the Webots world frame.
 //   * Robot body frame: +Y FORWARD, +X RIGHT, +Z up.
 //   * State [x, y, theta]: theta is the rotation field<-robot about +Z, i.e. the angle of the robot's

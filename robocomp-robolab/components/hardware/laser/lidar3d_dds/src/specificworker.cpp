@@ -19,6 +19,7 @@
 #include "specificworker.h"
 #include "dds_publisher.h"
 #include "mesh_filter.h"
+#include <cstdlib>   // std::getenv (OMP_WAIT_POLICY report)
 #include <cppitertools/enumerate.hpp>
 #include <algorithm>
 #include <cmath>
@@ -108,6 +109,23 @@ SpecificWorker::SpecificWorker(const ConfigLoader& configLoader, TuplePrx tprx, 
 		#ifdef HIBERNATION_ENABLED
 			hibernationChecker.start(500);
 		#endif
+
+		// ── THREADS: A HANDFUL, NOT THE WHOLE MACHINE ─────────────────────────────────────────────
+		// OpenMP and Embree (TBB) each default to one thread per core, so on a 32-core host this
+		// component ran ~72 threads to process ~29k points per scan. Worse, libgomp's default wait
+		// policy SPINS its idle workers between parallel loops, and with several loops per scan at
+		// 17 Hz they almost never sleep: measured 2026-10-01, ~1200% CPU (12 cores) of busy-waiting,
+		// 123% at 2 Hz, against 3% with OMP_WAIT_POLICY=PASSIVE for the same output. The wait policy
+		// is read when libgomp LOADS, before main(), so it must come from the environment (the
+		// launcher sets it: active_inference/utils/sub_husky.toml); the thread count can be set here.
+		// Threads.Count <= 0 keeps the library defaults.
+		threads_count_ = 4;
+		try { threads_count_ = this->configLoader.get<int>("Threads.Count"); } catch(...) {}
+		if (threads_count_ > 0)
+			omp_set_num_threads(threads_count_);
+		const char *wp = std::getenv("OMP_WAIT_POLICY");
+		std::cout << "[lidar3d_dds] threads: " << (threads_count_ > 0 ? std::to_string(threads_count_) : std::string("library default"))
+		          << " (OpenMP + Embree) | OMP_WAIT_POLICY=" << (wp ? wp : "<unset: idle workers SPIN>") << std::endl;
 
 
 		// Example statemachine:
@@ -268,6 +286,7 @@ void SpecificWorker::initialize()
     if (mesh_filter_enabled)
     {
         MeshFilter::Config mcfg;
+        mcfg.threads = threads_count_;
         mcfg.mount = this->robot_lidar;   // device -> robot mount (from shadow.json / config)
         try { mcfg.robot_name = this->configLoader.get<std::string>("Robot.name"); } catch(...) {}
         // Geometry source. "proto" assembles the WHOLE Webots robot definition (body + wheels +

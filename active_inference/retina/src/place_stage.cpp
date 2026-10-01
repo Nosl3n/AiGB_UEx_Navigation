@@ -1,3 +1,4 @@
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "place_stage.h"
 
 #include <genericworker.h>                       // DSR graph API
@@ -69,7 +70,7 @@ PlaceStage::PlaceStage(const PlaceStageConfig& cfg, std::shared_ptr<DSR::DSRGrap
     h.model_name = std::filesystem::path(cfg_.encoder.model_path).filename().string();
     h.azimuth_tune_deg = cfg_.azimuth_tune_deg;
     if (graph_)
-        if (const auto rooms = graph_->get_nodes_by_type("room"); not rooms.empty())
+        if (const auto rooms = rc::world::frame_nodes(*graph_); not rooms.empty())
             h.room_name = rooms.front().name();
     map_.set_header(h);
 
@@ -98,7 +99,7 @@ bool PlaceStage::robot_pose_in_room(std::uint64_t stamp,
                                     Eigen::Vector3f& pose, Eigen::Matrix3f& cov) const
 {
     if (not graph_ or not inner_) return false;
-    const auto rooms = graph_->get_nodes_by_type("room");
+    const auto rooms = rc::world::frame_nodes(*graph_);
     if (rooms.empty()) return false;
     const auto& room = rooms.front();
     const auto robots = graph_->get_nodes_by_type("robot");

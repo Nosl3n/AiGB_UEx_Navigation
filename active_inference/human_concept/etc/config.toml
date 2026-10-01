@@ -46,6 +46,22 @@ ReplayLoop = true
 MinValid = 12                    # fewer valid joints ⇒ raise the look affordance
 UncertaintyThresh = 0.05         # tr(cov) above this ⇒ raise the look affordance
 PoseCovScale = 0.02              # room→person RT covariance proxy = scale·tr(cov)
+DeathTimeoutS = 2.0              # seconds with NO evidence at all (no skeleton AND no LiDAR beam reaching the person)
+
+[HumanLidar]                     # the LiDAR as a "second look" (src/human_lidar_presence.h)
+Enabled = true
+BandZMin = 1.20                  # torso band (m above ground). 1.05 let frond tips in (crown top 0.95 m + tilt/noise): a phantom locked on a palm
+BandZMax = 1.85                  # up to the head: at 13 m the helios rings are ~0.5 m apart, a 0.5 m band caught 0-2 points
+BodyRadiusM = 0.25
+WalkMaxMps = 2.0
+FollowGateMaxM = 1.0
+CameraDepthSigmaK = 0.002         # camera-placed position σ = k·range² (stereo depth error)
+LatencyS = 0.05                  # sweep-vs-pose misregistration: σ += yaw rate × this × range
+DetectionProb = 0.85
+ClutterProb = 0.05
+LogOddsBirth = 2.0
+LogOddsMax = 4.0
+RemovalProb = 0.2
 
 [HumanModel]
 Anchors = "1,2,5,8,11"           # neck, shoulders, hips

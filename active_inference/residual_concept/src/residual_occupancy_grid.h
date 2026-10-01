@@ -662,6 +662,20 @@ public:
     void set_self_body(float x, float y, float radius_m)
     { self_x_ = x; self_y_ = y; self_r_ = radius_m; observer_valid_ = true; }
 
+    // THE ROBOT'S OWN SHAPE instead of a disc around a sensor (Grid.SelfBodyShape = "robot"). An oriented
+    // rectangle — the footprint measured from the robot's mesh plus a margin — centred on the ROBOT, with its
+    // heading. When set it replaces the disc in the self-body term; the OBSERVER (range weights, clearance
+    // shell) stays where set_self_body put it, at the sensor. Why: the disc assumes the sensor sits on the
+    // robot's axis. On the Husky the helios is on a mast 25 cm behind the centre, so a 0.55 m disc around it
+    // left the front-mounted ZED (0.68 m away) outside the body and its returns became phantom occupancy.
+    // yaw = rotation of the robot's +X (right) axis from the world +X, as in every RT edge here.
+    void set_self_box(float cx, float cy, float yaw, float half_w, float half_d)
+    {
+        box_cx_ = cx; box_cy_ = cy; box_c_ = std::cos(yaw); box_s_ = std::sin(yaw);
+        box_hw_ = half_w; box_hd_ = half_d; box_on_ = half_w > 0.0f and half_d > 0.0f;
+    }
+    void clear_self_box() { box_on_ = false; }
+
     // Integrate one sensor sweep (room frame). origin = sensor position (room). See the header comment.
     //
     // CRITICAL (occupancy-grid correctness): the inverse sensor model must be applied ONCE PER CELL PER SCAN,
@@ -846,6 +860,8 @@ private:
     float fp_rms_ = 0;                            // that fit's own residual scatter (m) = σ of the floor component
     float dev_floor_z0_ = -1.0f;                  // per-device nav band (m); <0 ⇒ unset ⇒ use p_.floor_z0
     float self_x_ = 0, self_y_ = 0, self_r_ = 0;  // robot body envelope this cycle (room frame); r<=0 ⇒ term off
+    bool  box_on_ = false;                        // set_self_box: oriented-rectangle body (replaces the disc)
+    float box_cx_ = 0, box_cy_ = 0, box_c_ = 1, box_s_ = 0, box_hw_ = 0, box_hd_ = 0;
     bool  observer_valid_ = false;                // set_self_body has been called ⇒ self_x_/self_y_ are a real
                                                   // observer position (range-weighted decay needs it; without it
                                                   // the origin would masquerade as the robot and skew the range)

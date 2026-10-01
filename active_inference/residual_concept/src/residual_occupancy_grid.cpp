@@ -533,9 +533,21 @@ void OccupancyGrid::integrate_sweep(const Eigen::Vector3f& origin, const std::ve
     // space is always safe, and the sensor's own voxel already emits a traversal.
     const auto world_w = [&](float px, float py)
     {
-        if (self_r_ <= 0.0f) return 1.0f;
         const float sigma = std::max(1e-3f, p_.self_body_sigma_m);
-        const float s = std::hypot(px - self_x_, py - self_y_) - self_r_;   // >0 outside the body envelope
+        float s;                                                                // >0 outside the body envelope
+        if (box_on_)
+        {
+            // Signed distance to the oriented rectangle (robot frame: x right, y forward).
+            const float dx = px - box_cx_, dy = py - box_cy_;
+            const float lx = box_c_ * dx + box_s_ * dy, ly = -box_s_ * dx + box_c_ * dy;
+            const float qx = std::abs(lx) - box_hw_, qy = std::abs(ly) - box_hd_;
+            s = std::hypot(std::max(qx, 0.0f), std::max(qy, 0.0f)) + std::min(std::max(qx, qy), 0.0f);
+        }
+        else
+        {
+            if (self_r_ <= 0.0f) return 1.0f;
+            s = std::hypot(px - self_x_, py - self_y_) - self_r_;
+        }
         return 0.5f * std::erfc(-s / (sigma * 1.41421356f));                 // Φ(s/σ)
     };
 

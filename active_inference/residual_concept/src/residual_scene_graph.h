@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -66,6 +67,7 @@ private:
     void write_rt_pose(ResidualInstance& inst, std::uint64_t room_node_id, std::uint64_t timestamp_ms);
 
     std::shared_ptr<DSR::DSRGraph> G_;
+    rc::world::FrameCache          world_;   // "room" indoors, "field" outdoors
     DSR::RT_API*        rt_api_      = nullptr;
     DSR::InnerEigenAPI* inner_eigen_ = nullptr;
     DSR::InnerGaussianAPI* gaussian_ = nullptr;

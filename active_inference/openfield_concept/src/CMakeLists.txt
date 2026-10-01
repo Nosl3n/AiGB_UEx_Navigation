@@ -13,6 +13,7 @@ LIST(APPEND SOURCES
   ../src/specificworker.cpp
   ../src/openfield_ekf.cpp
   ../src/openfield_scene_graph.cpp
+  ../src/openfield_viewer.cpp
 )
 
 # libdsr_core defines symbols that libdsr_{api,gui} only reference (UND); keep all libs (see bottle_concept).

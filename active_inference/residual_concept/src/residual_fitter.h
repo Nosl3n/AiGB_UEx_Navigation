@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include <cstdint>
 #include <fstream>
 #include <memory>
@@ -69,6 +70,7 @@ private:
     void log_ai2_csv(const ResidualInstance& inst, int point_count, float R, float energy);
 
     std::shared_ptr<DSR::DSRGraph> G_;
+    rc::world::FrameCache          world_;   // "room" indoors, "field" outdoors
     DSR::InnerEigenAPI*            inner_eigen_ = nullptr;
     ResidualConfig&               cfg_;
 

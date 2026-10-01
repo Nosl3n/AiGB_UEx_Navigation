@@ -19,6 +19,7 @@
 #include "../../common/object_affordance/object_affordance.h"   // rc::ObjectAffordance (SHARED)
 #include "vfe_inference.h"        // rc::human::AInfLaplacePoseEstimator / InferenceResult
 #include "../../common/belief_stabilizer/belief_stabilizer.h"   // rc::StabilizerState
+#include "../../common/existence_belief/existence_belief.h"     // rc::exist::ExistenceBelief
 
 namespace rc {
 
@@ -70,7 +71,23 @@ struct HumanInstance
 
     // ── Detection aliveness (active-perception feedback for the affordance contract) ────────────────
     int   frames_since_detection   = 100000;   // cycles since the last fresh skeleton (0 = just seen)
+    std::int64_t last_seen_ms      = 0;        // steady-clock ms of the last fresh skeleton (or of the birth)
     float last_mask_confidence     = 0.0f;     // mean joint confidence of the last fresh skeleton
+
+    // ── Existence (camera + LiDAR) — removal is a decision on P(exists), not a miss counter ─────────
+    // Camera: a fresh skeleton is evidence FOR. LiDAR: torso-band returns at the person are FOR, beams that
+    // pass THROUGH where the person should be are AGAINST, no beam reaching it (occluded / out of range) is
+    // no evidence at all (HOLD). last_evidence_ms backs it up only when NOTHING can see the person.
+    rc::exist::ExistenceBelief existence{2.0f, 4.0f};
+    bool         existence_armed   = false;
+    std::int64_t last_evidence_ms  = 0;
+    std::int64_t last_fix_ms       = 0;        // last position fix (camera fit or LiDAR follow)
+    bool         fix_by_camera     = true;     // who made it: the camera's σ grows with range², the LiDAR's does not
+    int          lidar_hits        = 0;        // band points used by the last LiDAR follow (diagnostic)
+    float        lidar_cam_gap_m   = -1.0f;    // |LiDAR centre − camera pelvis| at the last fit (diagnostic)
+    std::uint64_t lidar_follows    = 0;        // sweeps that re-centred this person (diagnostic)
+    float        lidar_range_m = 0.f;                                      // helios → person (diagnostic)
+    float        lidar_e_occ = 0.f, lidar_e_free = 0.f, lidar_sigma = 0.f;   // last carve (diagnostic)
     bool  detection_alive          = false;
     bool  last_pub_detection_alive = false;
     float last_pub_detection_conf  = -1.0f;

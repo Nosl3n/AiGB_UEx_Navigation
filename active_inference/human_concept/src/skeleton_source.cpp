@@ -5,6 +5,7 @@
 #include "skeleton_source.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <limits>
@@ -150,7 +151,7 @@ std::vector<SkeletonBody> DsrSkeletonSource::poll()
     Mat::RTMat world_T_cam = Mat::RTMat::Identity();
     bool have_tf = false;
     if (inner_eigen_)
-        if (const auto T = inner_eigen_->get_transformation_matrix(world_frame_, camera_frame_, capture_ts); T.has_value())
+        if (const auto T = inner_eigen_->get_transformation_matrix(world_name(), camera_frame_, capture_ts); T.has_value())
         {
             world_T_cam = T.value();
             have_tf = true;
@@ -188,9 +189,12 @@ std::vector<SkeletonBody> DsrSkeletonSource::poll()
         bodies.push_back(std::move(body));
     }
 
+    if (have_tf)   // ids only mean something in the world frame
+        assign_track_ids(bodies, static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch()).count()));
     if (not have_tf and not bodies.empty())
         std::print("human_concept: [dsr] no {}<-{} transform yet — skeletons left in camera frame\n",
-                   world_frame_, camera_frame_);
+                   world_name(), camera_frame_);
     return bodies;
 }
 
@@ -210,6 +214,93 @@ std::unique_ptr<SkeletonSource> make_skeleton_source(const std::string& kind,
     if (kind != "replay")
         std::print("human_concept: [source] unknown kind '{}' — defaulting to replay\n", kind);
     return std::make_unique<ReplaySkeletonSource>(replay_path, replay_loop);
+}
+
+// The frame the skeletons are expressed in: the configured one, or the graph's world frame if none.
+std::string DsrSkeletonSource::world_name() const
+{
+    return world_frame_.empty() and G_ ? rc::world::frame_name(*G_) : world_frame_;
+}
+
+void DsrSkeletonSource::refresh_track(int id, const Eigen::Vector2f& xy, std::int64_t now_ms)
+{
+    if (const auto it = std::ranges::find(tracks_, id, &Track::id); it != tracks_.end())
+    {
+        it->xy = xy;
+        it->seen_ms = now_ms;
+    }
+    else
+        tracks_.push_back({id, xy, now_ms});   // retired while the camera was blind; the LiDAR kept the person
+}
+
+void DsrSkeletonSource::forget_track(int id)
+{
+    std::erase_if(tracks_, [id](const Track& t) { return t.id == id; });
+}
+
+// Greedy nearest-neighbour association on the body centre (hips, else neck, else the mean of the valid
+// joints), cheapest pair first, so two people in view never trade identities. Tracks not seen for 3 s retire
+// (their person node has long been pruned by human_concept's own absence counter by then).
+void DsrSkeletonSource::assign_track_ids(std::vector<SkeletonBody> &bodies, std::int64_t now_ms)
+{
+    constexpr float kWalkMaxMps = 2.0f;     // a brisk walk / jog: the most a farm worker covers per second
+    constexpr float kNoiseM     = 0.35f;    // centre jitter from keypoint depth noise and partial occlusion
+    constexpr std::int64_t kRetireMs = 3000;
+    std::erase_if(tracks_, [&](const Track &t) { return now_ms - t.seen_ms > kRetireMs; });
+
+    const auto centre = [](const SkeletonBody &b) -> std::optional<Eigen::Vector2f>
+    {
+        const auto ok = [&](int j) { return std::isfinite(b.kp(j, 0)) and std::isfinite(b.kp(j, 1)); };
+        if (ok(human::KP::R_HIP) and ok(human::KP::L_HIP))
+            return Eigen::Vector2f(0.5f * (b.kp(human::KP::R_HIP, 0) + b.kp(human::KP::L_HIP, 0)),
+                                   0.5f * (b.kp(human::KP::R_HIP, 1) + b.kp(human::KP::L_HIP, 1)));
+        if (ok(human::KP::NECK)) return Eigen::Vector2f(b.kp(human::KP::NECK, 0), b.kp(human::KP::NECK, 1));
+        Eigen::Vector2f s = Eigen::Vector2f::Zero(); int n = 0;
+        for (int j = 0; j < human::NUM_KP; ++j) if (ok(j)) { s += Eigen::Vector2f(b.kp(j, 0), b.kp(j, 1)); ++n; }
+        return n ? std::optional<Eigen::Vector2f>(s / static_cast<float>(n)) : std::nullopt;
+    };
+
+    struct Pair { float d; std::size_t b; std::size_t t; };
+    std::vector<Pair> pairs;
+    std::vector<std::optional<Eigen::Vector2f>> c(bodies.size());
+    for (std::size_t b = 0; b < bodies.size(); ++b)
+    {
+        c[b] = centre(bodies[b]);
+        if (not c[b]) continue;
+        for (std::size_t t = 0; t < tracks_.size(); ++t)
+        {
+            const float gate = kNoiseM + kWalkMaxMps * 1e-3f * static_cast<float>(now_ms - tracks_[t].seen_ms);
+            if (const float d = (*c[b] - tracks_[t].xy).norm(); d < gate) pairs.push_back({d, b, t});
+        }
+    }
+    std::sort(pairs.begin(), pairs.end(), [](const Pair &a, const Pair &b) { return a.d < b.d; });
+    std::vector<bool> body_done(bodies.size(), false), track_done(tracks_.size(), false);
+    for (const auto &p : pairs)
+    {
+        if (body_done[p.b] or track_done[p.t]) continue;
+        body_done[p.b] = track_done[p.t] = true;
+        bodies[p.b].id = tracks_[p.t].id;
+        tracks_[p.t].xy = *c[p.b];
+        tracks_[p.t].seen_ms = now_ms;
+    }
+    // Two torsos cannot stand closer than ~a body width: an unmatched skeleton that close to one already placed
+    // this frame is the SAME person detected twice (YOLO-pose duplicate), not a newcomer. It was births like
+    // person_1 at 0.3 m from person_0, alive for the 2 s an orphan takes to die.
+    constexpr float kTwoBodiesMinM = 0.5f;
+    std::vector<bool> duplicate(bodies.size(), false);
+    for (std::size_t b = 0; b < bodies.size(); ++b)
+    {
+        if (body_done[b] or not c[b]) continue;
+        for (std::size_t o = 0; o < bodies.size(); ++o)
+            if (o != b and body_done[o] and c[o] and (*c[b] - *c[o]).norm() < kTwoBodiesMinM)
+                { duplicate[b] = true; break; }
+        if (duplicate[b]) continue;
+        bodies[b].id = next_track_id_++;
+        tracks_.push_back({bodies[b].id, *c[b], now_ms});
+        body_done[b] = true;
+    }
+    std::size_t k = 0;
+    std::erase_if(bodies, [&](const SkeletonBody&) { return duplicate[k++]; });
 }
 
 }  // namespace rc

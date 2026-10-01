@@ -101,7 +101,7 @@ Emergency = 500
 # ──────────────────────────────────────────────────────────────────────────────
 
 [Presence]
-optional_agent_names = ["openfield_concept", "controller", "retina"]
+optional_agent_names = ["openfield_concept", "residual_concept", "controller", "retina"]
 config_dir = "etc"
 monitor_period_ms = 500
 heartbeat_timeout_ms = 15000  # match controller/room_concept; 3s was hypersensitive to graph-publish stalls

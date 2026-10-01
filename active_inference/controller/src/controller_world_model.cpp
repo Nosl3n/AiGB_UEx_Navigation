@@ -1,3 +1,4 @@
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "controller_world_model.h"
 
 #include <algorithm>
@@ -38,10 +39,11 @@ bool ControllerWorldModel::refresh_graph_state()
 
     if (graph_state_.room_name.empty())
     {
-        if (const auto room_nodes = graph_->get_nodes_by_type("room"); !room_nodes.empty())
+        // The world frame: a `room` indoors, a `field` outdoors (openfield_concept). Same contract.
+        if (const auto frame = rc::world::frame_node(*graph_); frame.has_value())
         {
-            graph_state_.room_id = room_nodes.front().id();
-            graph_state_.room_name = room_nodes.front().name();
+            graph_state_.room_id = frame->id();
+            graph_state_.room_name = frame->name();
         }
     }
     else if (!graph_->get_node(graph_state_.room_id).has_value())

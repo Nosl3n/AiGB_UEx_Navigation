@@ -61,7 +61,27 @@ struct HumanConfig
     std::string fit_csv_path = "";   // non-empty → per-cycle fit-diagnostics CSV (gate)
 
     // ── Simple active-inference action policy (the prototype's "action hint") ────────────────────────
-    int   death_frames       = 60;     // cycles a person may go unseen before its node is removed (~3 s @20 Hz)
+    int   death_frames       = 60;     // (legacy, unused: see death_timeout_s)
+    // Seconds a person may go UNSEEN before its node is removed; while seen it lives on. A wall clock, not a
+    // cycle count: frames_since_detection only advanced when fresh data arrived, so a person who stopped being
+    // seen was never counted as absent and lived forever (2026-10-01: 35 nodes for 2 workers).
+    float death_timeout_s    = 2.0f;   // now: seconds with NO evidence at all (neither camera nor LiDAR)
+
+    // ── LiDAR "second look" (existence + follow; see human_lidar_presence.h) ─────────────────────────
+    bool  lidar_enabled        = true;
+    float lidar_band_z_min     = 1.20f;  // torso band, field frame (m above ground). Above the young palms'
+    float lidar_band_z_max     = 1.85f;  //   crown top (0.95 m) so a palm can neither confirm nor occlude a person
+    float body_radius_m        = 0.25f;  // torso half-width: the carved box is 2r × 2r
+    float walk_max_mps         = 2.0f;   // follow gate grows with this × time since the last position fix
+    float follow_gate_max_m    = 1.0f;   // ...up to this
+    float lidar_latency_s      = 0.05f;  // sweep-stamp vs robot-pose misregistration; × yaw rate × range = σ
+    float cam_depth_sigma_k    = 0.002f; // camera-placed position σ = k·range² (stereo depth); 0.29 m at 12 m —
+                                         //   measured |LiDAR − camera| 0.15-0.3 m at 10-14 m (2026-10-01)
+    float exist_detection_prob = 0.85f;  // P(LiDAR/camera sees the person | there)
+    float exist_clutter_prob   = 0.05f;  // P(returns in the torso box | nobody there)
+    float exist_l0             = 2.0f;   // log-odds at birth (one skeleton is real evidence)
+    float exist_l_max          = 4.0f;
+    float exist_removal_prob   = 0.2f;   // remove once P(exists) falls below this
     int   min_valid          = 12;     // fewer valid joints ⇒ raise the look affordance
     float uncertainty_thresh = 0.05f;  // tr(cov) above this ⇒ raise the look affordance
 

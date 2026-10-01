@@ -16,6 +16,7 @@
  *    You should have received a copy of the GNU General Public License
  *    along with RoboComp.  If not, see <http://www.gnu.org/licenses/>.
  */
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "specificworker.h"
 
 #include "place_stage.h"
@@ -2421,7 +2422,7 @@ std::string SpecificWorker::run_depth_enrichment(const std::function<void(const 
     rc::depth::RoomGeometry fb;
     if (scene_processor)
         scene_processor->get_room_layout(fb.poly_x, fb.poly_y, fb.height);
-    if (const auto rn = G->get_nodes_by_type("room"); not rn.empty())
+    if (const auto rn = rc::world::frame_nodes(*G); not rn.empty())
         fb.room = rn.front().name();
     if (not robot_T_ricoh_ and inner_eigen_api != nullptr and scene_processor)
     {

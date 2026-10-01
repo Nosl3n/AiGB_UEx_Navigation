@@ -183,6 +183,7 @@ class SpecificWorker : public GenericWorker
         // FPS
         FPSCounter fps;
         std::atomic<std::chrono::high_resolution_clock::time_point> last_read;
+        int threads_count_ = 4;   // Threads.Count: OpenMP + Embree worker threads (<= 0: library defaults)
         int MAX_INACTIVE_TIME = 5;  // secs after which the component is paused. It reactivates with a new reset
 
         RoboCompLidar3D::TDataImage lidar2cam(const RoboCompLidar3D::TData &lidar_data);

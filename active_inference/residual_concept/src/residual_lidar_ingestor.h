@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -51,6 +52,7 @@ public:
 
 private:
     std::shared_ptr<DSR::DSRGraph>               G_;
+    rc::world::FrameCache                        world_;   // "room" indoors, "field" outdoors
     DSR::InnerEigenAPI*                          inner_eigen_ = nullptr;
     const ResidualConfig*                        cfg_ = nullptr;
     // Shared media-plane reader (the same one every agent uses): the high "helios" plane (DEVICE

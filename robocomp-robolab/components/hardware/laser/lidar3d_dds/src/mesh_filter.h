@@ -45,6 +45,7 @@ public:
     struct Config
     {
         std::string robot_name = "Shadow";   // "Shadow" (static STL) | "P3Bot" (URDF)
+        int threads = 0;                     // Embree (TBB) worker threads; 0 = Embree's default (= every core)
 
         // WHERE THE ROBOT'S SHAPE COMES FROM.  "proto" | "mesh"
         //

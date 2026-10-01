@@ -100,6 +100,7 @@ ResidualConfig load_residual_config(const ConfigLoader& cfg)
 
     // ── ZED dense-depth boost ──
     out.zed_boost_enabled       = getb("ZedBoost.Enabled",       true);
+    out.zed_dump_csv_path       = gets("ZedBoost.DumpCsvPath",   "");
     out.zed_detection_enabled   = getb("ZedBoost.FeedDetection", false);   // dense ZED → clustering
     out.grid_zed_enabled        = getb("ZedBoost.FeedGrid",      true);    // dense ZED → occupancy grid
     out.grid_field_ema_up       = getf("Grid.FieldEmaUp",        1.0f);    // published-field temporal low-pass (rise)
@@ -132,6 +133,8 @@ ResidualConfig load_residual_config(const ConfigLoader& cfg)
     out.grid_inflate_radius_m   = getf("Grid.InflateRadiusM",    0.0f);    // 0: controller does exact footprint
     out.grid_self_body_radius_m = getf("Grid.SelfBodyRadiusM",   0.55f);   // body envelope for the sensor-model term
     out.grid_self_body_sigma_m  = getf("Grid.SelfBodySigmaM",    0.08f);   // its positional uncertainty
+    out.grid_self_body_shape    = gets("Grid.SelfBodyShape",     "disc");  // "disc" | "robot" (oriented footprint)
+    out.grid_self_body_margin_m = getf("Grid.SelfBodyMarginM",   0.05f);   // grown on every side of the footprint
     out.grid_pose_precision     = getb("Grid.PosePrecision",    true);    // localiser σ as an evidence weight
     out.grid_floor_responsibility = getb("Grid.FloorResponsibility", true); // floor in the per-return mixture
     out.grid_floor_return_clears  = getb("Grid.FloorReturnClears",   true); // a floor return frees its own cell

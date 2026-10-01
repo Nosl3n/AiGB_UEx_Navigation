@@ -28,6 +28,7 @@
 #include <QDateTime>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <locale>
@@ -118,6 +119,7 @@ void SpecificWorker::load_config()
 	opt("Imu.Node", cfg_.imu_node);
 	opt("Gps.PollPeriodMs", cfg_.gps_poll_period_ms);
 	opt("Diag.CsvPath", cfg_.csv_path);
+	opt("Viewer.Enabled", cfg_.viewer);
 
 	std::println("[openfield] EKF: gps sigma {} m, yaw sigma {} rad, lever ({}, {}) m | IMU yaw {} every {} ms",
 	             e.gps_sigma_m, e.yaw_sigma_rad, e.gps_lever.x(), e.gps_lever.y(),
@@ -173,6 +175,26 @@ void SpecificWorker::initialize()
 
 	QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit,
 	                 this, &SpecificWorker::terminal_shutdown, Qt::UniqueConnection);
+
+	start_ms_ = QDateTime::currentMSecsSinceEpoch();
+	if (cfg_.viewer)
+	{
+		viewer_ = std::make_unique<rc::openfield::OpenFieldViewer>();
+		// The switches only change which measurements the EKF fuses; prediction never stops. With the GPS off
+		// the position is pure dead reckoning and its covariance grows — which is what the window shows.
+		connect(viewer_.get(), &rc::openfield::OpenFieldViewer::gpsToggled, this, [this](bool on)
+		{
+			gps_enabled_ = on;
+			gps_off_since_ms_ = on ? 0 : QDateTime::currentMSecsSinceEpoch();
+			std::println("[openfield] GPS {} by the user", on ? "ON" : "OFF — dead reckoning only");
+		});
+		connect(viewer_.get(), &rc::openfield::OpenFieldViewer::yawToggled, this, [this](bool on)
+		{
+			yaw_enabled_ = on;
+			std::println("[openfield] IMU absolute yaw {} by the user", on ? "ON" : "OFF — gyro integration only");
+		});
+		viewer_->show();
+	}
 }
 
 // ── One Operating tick ────────────────────────────────────────────────────────────────────────────
@@ -192,6 +214,8 @@ void SpecificWorker::compute()
 			publish_pose();
 	}
 	log_status();
+	if (viewer_ and (compute_ticks_++ % 5) == 0)   // ~10 Hz at Period.Compute = 20 ms
+		push_viewer();
 	fps_.print("[openfield_concept Compute]");
 }
 
@@ -199,6 +223,17 @@ void SpecificWorker::compute()
 void SpecificWorker::pump_imu()
 {
 	const auto now = QDateTime::currentMSecsSinceEpoch();
+	// ── FOLLOW THE DESCRIPTOR, NOT THE FIRST PRODUCER ────────────────────────────────────────────────────
+	// The IMU's producer can change under us: launched before the sensor layer, we subscribe to the plane
+	// robot_concept BRIDGES; when imu_dds comes up, robot_concept stops bridging and relays imu_dds's
+	// descriptor instead (different QoS), and a reader built for the old one never matches the new writer.
+	// Seen 2026-10-01: initialised, then "primary input STALLED" for good. So a stream silent for 1 s drops
+	// the subscriber and the throttled path below rebuilds it from whatever the graph advertises NOW.
+	if (imu_sub_ and last_imu_recv_ms_ > 0 and now - last_imu_recv_ms_ > 1000 and now - last_imu_try_ms_ > 1000)
+	{
+		std::println("[openfield] IMU silent for {} ms — re-subscribing from the current descriptor", now - last_imu_recv_ms_);
+		imu_sub_.reset();
+	}
 	if (not imu_sub_)
 	{
 		// The producer advertises its descriptor during ITS startup; "not yet" is not "never".
@@ -225,7 +260,8 @@ void SpecificWorker::pump_imu()
 
 		// The absolute yaw is a strong measurement; applying it at 120 Hz would treat 120 correlated
 		// samples as independent and make the filter far more certain than the sensor is.
-		if (cfg_.use_imu_yaw and ekf_.initialized() and clock - last_yaw_update_clock_ms_ >= cfg_.yaw_update_period_ms)
+		if (cfg_.use_imu_yaw and yaw_enabled_ and ekf_.initialized()
+		    and clock - last_yaw_update_clock_ms_ >= cfg_.yaw_update_period_ms)
 		{
 			ekf_.correct_yaw(f.yaw());
 			last_yaw_update_clock_ms_ = clock;
@@ -281,6 +317,8 @@ void SpecificWorker::poll_gps()
 	if (last_gps_xy_.has_value() and (xy - *last_gps_xy_).norm() == 0.0) return;
 	last_gps_xy_ = xy;
 	++gps_fixes_;
+	last_gps_new_ms_ = now;
+	if (not gps_enabled_) return;                        // switched off in the window: read, never fused
 
 	if (not ekf_.initialized())
 	{
@@ -290,7 +328,9 @@ void SpecificWorker::poll_gps()
 		std::println("[openfield] initialized from GPS ({:.3f}, {:.3f}) and IMU yaw {:.3f} rad", x, y, *last_imu_yaw_);
 		return;
 	}
+	last_gps_innovation_m_ = (xy - ekf_.predicted_antenna()).norm();
 	ekf_.correct_gps(xy);
+	++gps_fused_;
 }
 
 // ── The field boundary: local metres, or GPS coordinates converted like the bridge does ───────────
@@ -375,32 +415,13 @@ void SpecificWorker::log_status()
 	const auto &P = ekf_.covariance();
 	const double sx = std::sqrt(P(0, 0)), sy = std::sqrt(P(1, 1)), st = std::sqrt(P(2, 2));
 
-	// Ground truth (simulation only; robot_concept writes it from the supervisor). The bridge's angle is
-	// atan2(R01, R00) - pi/2 of the robot's rotation, i.e. -(yaw) - pi/2; convert to this filter's theta.
 	double gx = NAN, gy = NAN, gth = NAN, exy = NAN, eth = NAN;
 	std::int64_t gt_lag_ms = -1;
-	if (const auto rid = scene_graph_->robot_id(); rid != 0)
-		if (const auto n = G->get_node(rid); n.has_value())
-		{
-			const auto ax = G->get_attrib_by_name<robot_gt_x_att>(n.value());
-			const auto ay = G->get_attrib_by_name<robot_gt_y_att>(n.value());
-			const auto aa = G->get_attrib_by_name<robot_gt_angle_att>(n.value());
-			const auto ats = G->get_attrib_by_name<robot_gt_timestamp_att>(n.value());
-			if (ax.has_value() and ay.has_value() and aa.has_value())
-			{
-				gx = ax.value(); gy = ay.value(); gth = wrap_pi(-(aa.value() + M_PI_2));
-				// Grade the estimate AT the ground truth's timestamp; fall back to the newest one.
-				Eigen::Vector3d est = x;
-				if (ats.has_value())
-					if (const auto at = pose_at(static_cast<std::int64_t>(ats.value())); at.has_value())
-					{
-						est = *at;
-						gt_lag_ms = now - static_cast<std::int64_t>(ats.value());
-					}
-				exy = std::hypot(est(0) - gx, est(1) - gy);
-				eth = wrap_pi(est(2) - gth);
-			}
-		}
+	if (const auto ge = gt_error(); ge.has_value())
+	{
+		gx = ge->gt(0); gy = ge->gt(1); gth = ge->gt(2); exy = ge->err_xy; eth = ge->err_theta;
+		gt_lag_ms = ge->stamped ? 0 : -1;
+	}
 	std::println("[openfield] pose ({:.3f}, {:.3f}, {:.3f} rad) sigma ({:.3f}, {:.3f} m, {:.4f} rad) | gps fixes {} "
 	             "| published {} | GT err {} ",
 	             x(0), x(1), x(2), sx, sy, st, gps_fixes_, published_,
@@ -410,6 +431,72 @@ void SpecificWorker::log_status()
 	if (csv_.is_open())
 		csv_ << now << ',' << x(0) << ',' << x(1) << ',' << x(2) << ',' << sx << ',' << sy << ',' << st << ','
 		     << gps_fixes_ << ',' << gx << ',' << gy << ',' << gth << ',' << exy << ',' << eth << '\n' << std::flush;
+}
+
+// Ground truth (simulation only; robot_concept writes it from the supervisor). The bridge's angle is
+// atan2(R01, R00) - pi/2 of the robot's rotation, i.e. -(yaw) - pi/2; converted to this filter's theta.
+// The estimate is graded AT the ground truth's own timestamp (pose_history_), else against the newest one.
+std::optional<SpecificWorker::GtError> SpecificWorker::gt_error() const
+{
+	if (not ekf_.initialized() or not scene_graph_) return std::nullopt;
+	const auto rid = scene_graph_->robot_id();
+	if (rid == 0) return std::nullopt;
+	const auto n = G->get_node(rid);
+	if (not n.has_value()) return std::nullopt;
+	const auto ax = G->get_attrib_by_name<robot_gt_x_att>(n.value());
+	const auto ay = G->get_attrib_by_name<robot_gt_y_att>(n.value());
+	const auto aa = G->get_attrib_by_name<robot_gt_angle_att>(n.value());
+	const auto ats = G->get_attrib_by_name<robot_gt_timestamp_att>(n.value());
+	if (not (ax.has_value() and ay.has_value() and aa.has_value())) return std::nullopt;
+	GtError e;
+	e.gt = {ax.value(), ay.value(), wrap_pi(-(aa.value() + M_PI_2))};
+	Eigen::Vector3d est = ekf_.state();
+	if (ats.has_value())
+		if (const auto at = pose_at(static_cast<std::int64_t>(ats.value())); at.has_value())
+		{ est = *at; e.stamped = true; }
+	e.err_xy = std::hypot(est(0) - e.gt(0), est(1) - e.gt(1));
+	e.err_theta = wrap_pi(est(2) - e.gt(2));
+	return e;
+}
+
+void SpecificWorker::push_viewer()
+{
+	const auto now = QDateTime::currentMSecsSinceEpoch();
+	// ── Test hook (env, off by default): drive the GPS switch and grab the window, for headless checks.
+	//    OPENFIELD_TEST_GPS_OFF=<s> / OPENFIELD_TEST_GPS_ON=<s> after start; OPENFIELD_SNAPSHOT=<file.png>
+	//    is saved every 5 s.
+	{
+		static const double off_s = std::getenv("OPENFIELD_TEST_GPS_OFF") ? std::atof(std::getenv("OPENFIELD_TEST_GPS_OFF")) : -1.0;
+		static const double on_s  = std::getenv("OPENFIELD_TEST_GPS_ON")  ? std::atof(std::getenv("OPENFIELD_TEST_GPS_ON"))  : -1.0;
+		const double t = 1e-3 * static_cast<double>(now - start_ms_);
+		static bool off_done = false, on_done = false;
+		if (off_s >= 0 and not off_done and t >= off_s) { off_done = true; viewer_->set_gps_checked(false); }
+		if (on_s  >= 0 and not on_done  and t >= on_s)  { on_done  = true; viewer_->set_gps_checked(true); }
+		static std::int64_t last_snap = 0;
+		if (const char *snap = std::getenv("OPENFIELD_SNAPSHOT"); snap and now - last_snap > 5000)
+		{ last_snap = now; viewer_->grab().save(QString::fromUtf8(snap)); }
+	}
+	rc::openfield::ViewerState s;
+	s.t_s = 1e-3 * static_cast<double>(now - start_ms_);
+	s.initialized = ekf_.initialized();
+	s.pose = ekf_.state();
+	s.cov = ekf_.covariance();
+	s.gps_enabled = gps_enabled_;
+	s.gps_fix = last_gps_xy_;
+	s.gps_fixes = gps_fixes_;
+	s.gps_fused = gps_fused_;
+	s.gps_age_s = last_gps_new_ms_ > 0 ? 1e-3 * static_cast<double>(now - last_gps_new_ms_) : -1.0;
+	s.gps_innovation_m = last_gps_innovation_m_;
+	s.seconds_without_gps = gps_off_since_ms_ > 0 ? 1e-3 * static_cast<double>(now - gps_off_since_ms_) : 0.0;
+	s.yaw_enabled = yaw_enabled_;
+	s.adv = odom_adv_; s.side = odom_side_; s.wheel_rot = odom_rot_;
+	s.gyro_z = last_gyro_z_;
+	s.imu_yaw = last_imu_yaw_;
+	s.imu_age_ms = static_cast<double>(imu_age_ms());
+	if (const auto ge = gt_error(); ge.has_value())
+	{ s.gt = ge->gt; s.err_xy = ge->err_xy; s.err_theta = ge->err_theta; }
+	s.polygon = field_polygon_;
+	viewer_->update_state(s);
 }
 
 // Linear interpolation in the published-pose history (heading along the short arc).
@@ -432,6 +519,7 @@ void SpecificWorker::request_shutdown()
 {
 	if (shutting_down_.exchange(true)) return;
 	if (G) disconnect(G.get(), nullptr, this, nullptr);
+	viewer_.reset();
 	imu_sub_.reset();
 	if (not owned_nodes_cleaned_)
 	{

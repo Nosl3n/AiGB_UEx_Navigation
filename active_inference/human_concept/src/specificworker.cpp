@@ -9,7 +9,9 @@
  * step_epistemic (reduce-occlusion affordance) → dashboard.
  */
 
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "specificworker.h"
+#include <QDateTime>
 
 #include "../../common/diag_log/rotating_csv.h"   // keep the previous run instead of wiping it
 #include "../../common/nbv/graph_obstacles.h"   // rc::nbv::sensor_from_graph / collect_graph_obstacles
@@ -88,6 +90,7 @@ void SpecificWorker::request_shutdown()
     save_window_settings();
     if (G)
         disconnect(G.get(), nullptr, this, nullptr);
+    lidar_ingestor_.reset();   // before inner_eigen_ (it holds the raw pointer) and before the graph goes
     inner_eigen_.reset();
     cleanup_owned_nodes();
 }
@@ -190,7 +193,7 @@ void SpecificWorker::initialize()
 
     remove_owned_person_nodes();
 
-    if (const auto rooms = G->get_nodes_by_type("room"); not rooms.empty())
+    if (const auto rooms = rc::world::frame_nodes(*G); not rooms.empty())
         room_node_id_ = rooms.front().id();
     else
         qWarning() << "human_concept: no room node found at startup";
@@ -200,6 +203,16 @@ void SpecificWorker::initialize()
 
     skeleton_source_ = rc::make_skeleton_source(cfg_.source_kind, cfg_.replay_path, cfg_.replay_loop,
                                                 G, inner_eigen_.get());
+    // ★THE FITTER WAS NEVER BUILT. fitter_ was declared and used everywhere, and compute() returns on
+    // `not fitter_` — so no person node could ever be created, indoors or out (found 2026-10-01 with
+    // retina publishing a clean BODY_18 skeleton and zero persons in the graph).
+    fitter_ = std::make_unique<rc::HumanFitter>(G, cfg_);
+    // LiDAR "second look" (human_lidar_presence.h). The subscriber comes up lazily inside pump(), on this
+    // (main) thread, once the helios node + its media descriptor exist.
+    lidar_presence_ = std::make_unique<rc::HumanLidarPresence>(cfg_);
+    if (cfg_.lidar_enabled)
+        lidar_ingestor_ = std::make_unique<rc::ConceptLidarIngestor>(
+            G, inner_eigen_.get(), [] { return rc::LidarGates{.helios_precision = 1.0f}; });
     epistemic_planner_ = rc::EpistemicPlanner(cfg_.epistemic_obs_distance, cfg_.epistemic_view_info);
     // ONE detector envelope: the far-side viewpoint is the argmax of the same model absence is weighted by,
     // and the published gain is multiplied by P(detect) there — so an orbit the detector could not fire from
@@ -241,15 +254,38 @@ void SpecificWorker::compute()
 
     if (room_node_id_ == 0)
     {
-        const auto rooms = G->get_nodes_by_type("room");
+        const auto rooms = rc::world::frame_nodes(*G);
         if (rooms.empty()) return;
         room_node_id_ = rooms.front().id();
     }
 
     // Poll this cycle's bodies once; hand them to the fitter and scaffold any new tracks.
     auto bodies = skeleton_source_->poll();
+    // Status line every 5 s: the one place that says whether skeletons arrive and persons exist.
+    {
+        static std::int64_t last_status = 0;
+        static std::size_t bodies_seen = 0;
+        bodies_seen += bodies.size();
+        const auto now = QDateTime::currentMSecsSinceEpoch();
+        if (now - last_status > 5000)
+        {
+            last_status = now;
+            std::print("human_concept: [status] world frame '{}' | bodies received {} (last 5 s) | person nodes {}\n",
+                       G->get_name_from_id(room_node_id_).value_or("?"), bodies_seen,
+                       G->get_nodes_by_type("person").size());
+            bodies_seen = 0;
+            for (const auto& [id, inst] : fitter_->instances())
+                std::print("human_concept: [status]   {} track={} P(exists)={:.2f} cam fits={} lidar pts={} follows={} "
+                           "|lidar-cam|={:.2f} m\n", inst.node_name, inst.track_id, inst.existence.p_exists(),
+                           inst.matched_frames, inst.lidar_hits, inst.lidar_follows, inst.lidar_cam_gap_m);
+        }
+    }
     scene_graph_->scaffold_missing_person_nodes(bodies, room_node_id_);
     fitter_->set_frame(std::move(bodies));
+
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+    step_lidar_presence(now_ms);
 
     for (const auto& node : G->get_nodes_by_type("person"))
         if (node.name().starts_with("person"))
@@ -260,21 +296,62 @@ void SpecificWorker::compute()
     fps_counter_.print("[Compute]", 3000);
 }
 
+void SpecificWorker::step_lidar_presence(std::int64_t now_ms)
+{
+    if (not lidar_ingestor_ or not lidar_presence_ or not lidar_ingestor_->pump() or not lidar_ingestor_->helios_fresh())
+        return;
+    // Robot yaw rate from consecutive world←robot poses (the sweep's misregistration grows with it).
+    float yaw_rate = 0.0f;
+    if (const auto robots = G->get_nodes_by_type("robot"); not robots.empty() and inner_eigen_)
+        if (const auto M = inner_eigen_->get_transformation_matrix(rc::world::frame_name(*G), robots.front().name(), 0);
+            M.has_value())
+        {
+            const float yaw = static_cast<float>(std::atan2(M.value()(1, 0), M.value()(0, 0)));
+            if (last_robot_yaw_ms_ > 0 and now_ms > last_robot_yaw_ms_)
+                yaw_rate = std::remainder(yaw - last_robot_yaw_, 2.0f * static_cast<float>(M_PI)) /
+                           (1e-3f * static_cast<float>(now_ms - last_robot_yaw_ms_));
+            last_robot_yaw_ = yaw;
+            last_robot_yaw_ms_ = now_ms;
+        }
+    if (lidar_presence_->step(fitter_->instances(), lidar_ingestor_->sweep_room(), lidar_ingestor_->origin_room(),
+                              now_ms, yaw_rate) == 0)
+        return;
+    // Keep the source's identity track where the LiDAR has carried the person, so the next skeleton there
+    // re-associates to the SAME id instead of birthing person_<new>.
+    for (auto& [id, inst] : fitter_->instances())
+        if (inst.last_fix_ms == now_ms and inst.last_seen_ms < now_ms)
+            if (const auto c = rc::HumanLidarPresence::centre_of(inst); c.has_value())
+                skeleton_source_->refresh_track(inst.track_id, *c, now_ms);
+}
+
 void SpecificWorker::prune_absent_persons()
 {
-    // Persistence/death: a short occlusion keeps the (frozen) model alive — the controller holds the
-    // last pose. Only once a person has gone unseen for DeathFrames cycles (enough evidence of absence)
-    // do we remove the node + its affordance and forget the instance.
-    std::vector<std::uint64_t> dead;
+    // Persistence/death: while a person is seen the node lives on; a short occlusion keeps the (frozen)
+    // model alive. Once unseen for DeathTimeoutS seconds (wall clock, counted from birth or the last fresh
+    // skeleton) the node + its affordance go and the instance is forgotten. Kept short (2 s) on purpose:
+    // identity across occlusions is still weak, and a stale person is worse than a re-born one.
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto timeout_ms = static_cast<std::int64_t>(1000.0f * cfg_.death_timeout_s);
+    std::vector<std::pair<std::uint64_t, std::string>> dead_why;
     for (auto& [id, inst] : fitter_->instances())
-        if (inst.frames_since_detection > cfg_.death_frames)
-            dead.push_back(id);
-    for (const auto id : dead)
     {
-        fitter_->instances().at(id).affordance.remove();
+        if (inst.existence.should_remove(cfg_.exist_removal_prob))
+            dead_why.emplace_back(id, std::format("P(exists)={:.2f} — the LiDAR sees through where it stood",
+                                                  inst.existence.p_exists()));
+        else if (now_ms - inst.last_evidence_ms > timeout_ms)
+            dead_why.emplace_back(id, std::format("no camera or LiDAR evidence for > {:.1f} s", cfg_.death_timeout_s));
+    }
+    for (const auto& [id, why] : dead_why)
+    {
+        auto& inst = fitter_->instances().at(id);
+        std::print("human_concept: person '{}' removed ({}; camera fits {}, LiDAR follows {}; last carve "
+                   "occ={:.1f} free={:.1f} σ={:.2f} m, band pts {})\n", inst.node_name, why, inst.matched_frames,
+                   inst.lidar_follows, inst.lidar_e_occ, inst.lidar_e_free, inst.lidar_sigma, inst.lidar_hits);
+        skeleton_source_->forget_track(inst.track_id);
+        inst.affordance.remove();
         G->delete_node(id);
         fitter_->forget_node(id);
-        std::print("human_concept: person id={} removed (unseen > {} cycles)\n", id, cfg_.death_frames);
     }
 }
 
@@ -285,7 +362,11 @@ void SpecificWorker::process_person_node(const DSR::Node& node)
     ++inst.processed_cycles;
 
     const auto observation = fitter_->observe(inst, node);
-    if (not observation.has_fresh_data and inst.matched_frames < 5)
+    if (observation.has_fresh_data)
+        lidar_presence_->on_camera_seen(inst, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                  std::chrono::steady_clock::now().time_since_epoch()).count());
+    // A LiDAR-carried person must still be published (its RT moves) even before 5 camera fits.
+    if (not observation.has_fresh_data and inst.matched_frames < 5 and inst.lidar_follows == 0)
         return;
 
     const float free_energy = fitter_->run_inference(inst, observation);
@@ -361,7 +442,7 @@ void SpecificWorker::step_epistemic(rc::HumanInstance& inst)
     Eigen::Vector2f camera_xy(std::numeric_limits<float>::quiet_NaN(),
                               std::numeric_limits<float>::quiet_NaN());
     if (inner_eigen_)
-        if (const auto c = inner_eigen_->transform("room", Mat::Vector3d(0.0, 0.0, 0.0), "zed", 0);
+        if (const auto c = inner_eigen_->transform(rc::world::frame_name(*G), Mat::Vector3d(0.0, 0.0, 0.0), "zed", 0);
             c.has_value())
             camera_xy = Eigen::Vector2f(static_cast<float>(c->x()), static_cast<float>(c->y()));
 

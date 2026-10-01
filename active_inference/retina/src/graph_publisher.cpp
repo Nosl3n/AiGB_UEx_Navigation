@@ -5,6 +5,7 @@
 // These pull in oneTBB (tbb/profiling.h). Include them BEFORE any header that activates Qt's `emit`
 // keyword macro (dsr_api.h via graph_publisher.h, and <QtGlobal>), otherwise the empty `emit` macro
 // mangles TBB's profiling.h and it fails to compile.
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "yolo_processor.h"   // SegDetection
 #include "yolo_human.h"       // rc::human_pose::PoseDetection, BODY18_FROM_COCO
 #include "yolo_semantic.h"    // rc::semantic::SemanticMap (graded posteriors)
@@ -432,7 +433,7 @@ void GraphPublisher::upload_masks(const RGBDData& rgbd, const Mat::RTMat& room_T
     float rt_gap_s = -1.0f;   // spacing between the two newest RT blocks in this replica (block density)
     if (params_.MASK_MOTION_ENABLED and frame_ts_ms > 0)
     {
-        const auto room_nodes  = G_->get_nodes_by_type("room");
+        const auto room_nodes  = rc::world::frame_nodes(*G_);
         const auto robot_nodes = G_->get_nodes_by_type("robot");
         if (not room_nodes.empty() and not robot_nodes.empty())
         {

@@ -68,6 +68,11 @@ struct ControllerParams
     // this is only a preference on top of it, tuning it for comfort can no longer make a reachable goal
     // unreachable — which is what the old stack could do, and did.
     float footprint_safety_margin_m = 0.05f;
+    // PEOPLE ARE OBSTACLES IN THEIR OWN RIGHT (Controller.PersonRadiusM). Each `person` node human_concept
+    // publishes becomes a disc of this radius around the person — the body plus the space a robot should leave
+    // a human — so avoiding them no longer depends on residual having marked them yet (a walking person's
+    // cells lag, and a person at mast height is half above the LiDAR band). 0 = off (indoor default).
+    float person_radius_m = 0.f;
     // Planning grid resolution. Independent of the residual's evidence grid: the planner does not need
     // centimetre fidelity, and cell count drives both memory and search time quadratically.
     float planner_cell_size_m = 0.06f;

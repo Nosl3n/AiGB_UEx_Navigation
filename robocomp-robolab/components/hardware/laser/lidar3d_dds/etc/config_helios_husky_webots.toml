@@ -159,6 +159,11 @@ HistoryDepth = 2   # 8->2: real-time media plane, shallow history (DDS_SHADOW.md
 SharedMemoryOnly = true
 DataSharing = true   # zero-copy SHM loans (static topology only — churn-unsafe, see media_transport.h)
 
+[Threads]
+# OpenMP + Embree worker threads. Both default to one per core (31 + 31 on this host) for ~29k points per
+# scan. 4 is plenty. Also launch with OMP_WAIT_POLICY=PASSIVE (sub_husky.toml) or idle workers busy-wait.
+Count = 4
+
 [Period]
 Compute = 50
 Emergency = 500

@@ -40,7 +40,10 @@ bool MeshFilter::init(const Config& cfg)
 {
     cfg_ = cfg;
 
-    m_device = rtcNewDevice(nullptr);
+    // Embree spawns a TBB pool the size of the machine unless told otherwise; the self-filter is a few
+    // hundred thousand short rays per scan and needs a handful (see Threads.Count in the config).
+    const std::string dev_cfg = cfg.threads > 0 ? "threads=" + std::to_string(cfg.threads) : std::string{};
+    m_device = rtcNewDevice(dev_cfg.empty() ? nullptr : dev_cfg.c_str());
     m_scene  = rtcNewScene(m_device);
     rtcSetSceneFlags(m_scene, RTC_SCENE_FLAG_DYNAMIC);
     rtcSetSceneBuildQuality(m_scene, RTC_BUILD_QUALITY_LOW);

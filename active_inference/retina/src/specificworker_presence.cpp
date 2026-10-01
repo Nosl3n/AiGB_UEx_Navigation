@@ -1,3 +1,4 @@
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "specificworker.h"
 #include "graph_publisher.h"
 #include <print>
@@ -57,7 +58,7 @@ void SpecificWorker::on_optional_peer_ready(const std::string &name, std::uint32
 bool SpecificWorker::room_node_present() const
 {
     // get_nodes_by_type is serialized by DSRGraph's shared_mutex → safe from the main (SM) thread.
-    return G and not G->get_nodes_by_type("room").empty();
+    return G and not rc::world::frame_nodes(*G).empty();
 }
 
 // One structured JSON line per FSM transition on stdout (not routed through qInfo, so it prints regardless

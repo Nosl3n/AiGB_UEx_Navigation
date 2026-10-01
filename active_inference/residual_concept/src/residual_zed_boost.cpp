@@ -108,7 +108,11 @@ std::vector<Eigen::Vector3f> voxel_downsample(const std::vector<Eigen::Vector3f>
         const auto key = std::make_tuple(static_cast<int>(std::floor(p.x() * inv)),
                                          static_cast<int>(std::floor(p.y() * inv)),
                                          static_cast<int>(std::floor(p.z() * inv)));
-        auto& acc = cells[key];
+        // ★try_emplace with an explicit ZERO. `cells[key]` value-initialises the pair, but Eigen's fixed-size
+        // vectors are NOT zeroed by their default constructor, so every new voxel started from whatever the
+        // allocator left there: centroids at 1e31 m, points 30 m behind a forward camera, phantom occupancy
+        // around the robot (measured on the Husky, 2026-10-01: 320 of 7867 FoV points behind the camera).
+        auto& acc = cells.try_emplace(key, Eigen::Vector3f::Zero(), 0).first->second;
         acc.first += p; ++acc.second;
     }
     out.reserve(cells.size());

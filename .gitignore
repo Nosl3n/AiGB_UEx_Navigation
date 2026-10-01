@@ -1,0 +1,13 @@
+# Root ignores for the whole snapshot (each sub-repo keeps its own .gitignore too).
+build/
+bin/
+__pycache__/
+*.pyc
+*.bak
+.vscode/
+
+# Runtime logs rotated by the agents on each start (the live file is kept, the rotated copies are not).
+active_inference/openfield_concept/tmp/*.csv.*
+
+# Webots per-user project state for scratch worlds.
+webots-agri/worlds/._tmp*

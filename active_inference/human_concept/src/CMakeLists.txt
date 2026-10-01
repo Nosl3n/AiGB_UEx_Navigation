@@ -18,6 +18,7 @@ include_directories(${HUMAN_CORE_DIR})
 # target_compile_features is a FLOOR of cxx_std_23, so the clamp is honoured, not overridden).
 add_subdirectory(${ACTIVE_INFERENCE_COMMON_DIR} ${CMAKE_CURRENT_BINARY_DIR}/ai_common EXCLUDE_FROM_ALL)
 LIST(APPEND LIBS
+  ai_common::media        # zero-copy media plane: helios sweeps for the LiDAR "second look"
   ai_common::presence     # agent presence monitor + coordinator
   ai_common::ui           # TimeSeriesPlot (compiled Q_OBJECT)
   ai_common::ui_headers   # custom_widget.h (header-only)
@@ -33,6 +34,7 @@ LIST(APPEND SOURCES
   ../src/skeleton_source.cpp
   ../src/human_scene_graph.cpp
   ../src/human_fitter.cpp
+  ../src/human_lidar_presence.cpp
   ../src/epistemic_planner.cpp
   ../src/prior_store.cpp
   ${HUMAN_CORE_DIR}/human_kinematic_model.cpp

@@ -2,6 +2,7 @@
  * residual_fitter.cpp — see residual_fitter.h
  */
 
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "residual_fitter.h"
 
 #include <algorithm>
@@ -38,7 +39,7 @@ bool ResidualFitter::ensure_instance(const DSR::Node& node, std::uint64_t room_n
     st.d      = G_->get_attrib_by_name<depth_m_att> (node).value_or(0.40f);
     st.height = G_->get_attrib_by_name<height_m_att>(node).value_or(0.80f);
     if (inner_eigen_)
-        if (const auto t = inner_eigen_->transform("room", Mat::Vector3d(0.0, 0.0, 0.0), node.name(), 0);
+        if (const auto t = inner_eigen_->transform(world_.name(*G_), Mat::Vector3d(0.0, 0.0, 0.0), node.name(), 0);
             t.has_value())
         { st.cx = static_cast<float>(t->x()); st.cy = static_cast<float>(t->y()); st.cz = static_cast<float>(t->z()); }
 

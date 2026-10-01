@@ -95,6 +95,20 @@ HumanConfig load_human_config(const ConfigLoader& cfg)
     out.fit_csv_path = gets("HumanModel.FitCsvPath", "");
 
     out.death_frames       = geti("HumanConcept.DeathFrames", 60);
+    out.death_timeout_s    = getf("HumanConcept.DeathTimeoutS", 2.0f);
+    out.lidar_enabled        = getb("HumanLidar.Enabled", true);
+    out.lidar_band_z_min     = getf("HumanLidar.BandZMin", 1.20f);
+    out.lidar_band_z_max     = getf("HumanLidar.BandZMax", 1.85f);
+    out.body_radius_m        = getf("HumanLidar.BodyRadiusM", 0.25f);
+    out.walk_max_mps         = getf("HumanLidar.WalkMaxMps", 2.0f);
+    out.follow_gate_max_m    = getf("HumanLidar.FollowGateMaxM", 1.0f);
+    out.cam_depth_sigma_k    = getf("HumanLidar.CameraDepthSigmaK", 0.002f);
+    out.lidar_latency_s      = getf("HumanLidar.LatencyS", 0.05f);
+    out.exist_detection_prob = getf("HumanLidar.DetectionProb", 0.85f);
+    out.exist_clutter_prob   = getf("HumanLidar.ClutterProb", 0.05f);
+    out.exist_l0             = getf("HumanLidar.LogOddsBirth", 2.0f);
+    out.exist_l_max          = getf("HumanLidar.LogOddsMax", 4.0f);
+    out.exist_removal_prob   = getf("HumanLidar.RemovalProb", 0.2f);
     out.min_valid          = geti("HumanConcept.MinValid", 12);
     out.uncertainty_thresh = getf("HumanConcept.UncertaintyThresh", 0.05f);
 

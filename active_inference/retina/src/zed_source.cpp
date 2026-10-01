@@ -1,3 +1,4 @@
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "zed_source.h"
 
 #include <chrono>
@@ -96,7 +97,7 @@ std::optional<PerceptionFrame> ZedSource::operator()()
     if (inner_eigen_ && graph_ && scene_)
     {
         std::string room_name, robot_name;
-        if (const auto rooms = graph_->get_nodes_by_type("room"); !rooms.empty())
+        if (const auto rooms = rc::world::frame_nodes(*graph_); !rooms.empty())
             room_name = rooms.front().name();
         if (const auto robots = graph_->get_nodes_by_type("robot"); !robots.empty())
             robot_name = robots.front().name();

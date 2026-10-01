@@ -43,6 +43,8 @@
 #include "skeleton_source.h"
 #include "human_scene_graph.h"
 #include "human_fitter.h"
+#include "human_lidar_presence.h"
+#include "../../common/lidar_ingestor/concept_lidar_ingestor.h"
 #include "prior_store.h"
 
 class SpecificWorker : public GenericWorker
@@ -120,6 +122,11 @@ private:
     std::unique_ptr<rc::SkeletonSource>  skeleton_source_;
     std::unique_ptr<rc::HumanSceneGraph> scene_graph_;
     std::unique_ptr<rc::HumanFitter>     fitter_;
+    std::unique_ptr<rc::ConceptLidarIngestor> lidar_ingestor_;   // helios sweeps, world frame (second look)
+    std::unique_ptr<rc::HumanLidarPresence>   lidar_presence_;
+    void step_lidar_presence(std::int64_t now_ms);
+    float        last_robot_yaw_    = 0.0f;
+    std::int64_t last_robot_yaw_ms_ = 0;
 
     FPSCounter fps_counter_;   // [Compute] period/fps/cpu/mem heartbeat (printed every 3 s)
 

@@ -30,17 +30,19 @@ stale_grace_ms = 120000
 agent_info_period_ms = 1000
 
 [Owns]
-# The room node is OURS here (the world frame every other agent reads); deleted on a graceful exit.
+# The field node is OURS (the world frame every other agent reads); deleted on a graceful exit.
 nodes = ["openfield_concept 25"]
-subtrees = ["room"]
+subtrees = ["field"]
 
 [Field]
-# The field boundary -> the room node's delimiting_polygon. Give EITHER local metres (x east, y north,
+# The field boundary -> the field node's delimiting_polygon. Give EITHER local metres (x east, y north,
 # origin = the world's gpsReference) OR GPS coordinates; local metres win if both are set.
 # The controller's planner marks everything outside it as occupied, and builds its grid over the
-# bounding box, so keep it the size of the working area. husky_test.wbt: the 30 x 30 m arena.
-PolygonX = [-14.5, 14.5, 14.5, -14.5]
-PolygonY = [-14.5, -14.5, 14.5, 14.5]
+# bounding box (and residual_concept its 5 cm occupancy grid), so keep it the size of the WORKING AREA.
+# husky_test.wbt: the 5 x 10 palm plot (x -5.6..5.6, y -7.35..7.35 with crowns) plus headlands to turn in
+# and the robot's start at (1.25, -10.5): 16 x 26 m. The whole 30 x 30 m arena would cost ~3x the cells.
+PolygonX = [-8.0, 8.0, 8.0, -8.0]
+PolygonY = [-13.0, -13.0, 13.0, 13.0]
 # PolygonLat = [38.87927, 38.87927, 38.87953, 38.87953]
 # PolygonLon = [-6.97087, -6.97053, -6.97053, -6.97087]
 RoomHeight = 5.0    # obstacle-cloud ceiling (no ceiling outdoors)
@@ -65,6 +67,11 @@ StallTimeoutMs = 2000   # primary-input gate: no IMU frame for this long -> back
 
 [Gps]
 PollPeriodMs = 50
+
+[Viewer]
+# The localization window: estimated pose vs ground truth, GPS / odometry / IMU readouts, and switches to
+# take the GPS (and the IMU's absolute yaw) out of the filter to watch dead-reckoning drift.
+Enabled = true
 
 [Diag]
 CsvPath = "tmp/openfield_pose.csv"

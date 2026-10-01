@@ -1,7 +1,7 @@
 # Sensorimotor layer for the Husky A300 in the agricultural worlds (plan.md, F2).
 #   python3 subcognitive.py sub_husky.toml
-# The launcher starts Webots with no world argument: open webots-agri/worlds/husky_test.wbt (or the
-# field world, F3) in it. The robot's DEF must be "husky" (bridge Robot.Def).
+# The launcher starts Webots with no world argument: open webots-agri/worlds/husky_field.wbt (tilled
+# ground, raised beds) or husky_test.wbt (flat) in it. The robot's DEF must be "husky" (bridge Robot.Def).
 #
 # Same components as sub_shadow.toml minus the Shadow-only ones (Ricoh 360 camera, bpearl): the
 # Husky carries the helios, the ZED, the IMU and, new, a GPS served by the bridge itself
@@ -20,7 +20,9 @@ ice_name = "Webots2Robocomp:tcp -h localhost -p 10006"
 [[components]]
 name = "helios"
 cwd = "~/robocomp/AiGB_UEx_Navigation/robocomp-robolab/components/hardware/laser/lidar3d_dds"
-cmd = "bin/lidar3d_dds etc/config_helios_husky_webots.toml"
+# OMP_WAIT_POLICY=PASSIVE: without it libgomp's idle workers busy-wait between scans (~12 cores at 17 Hz,
+# measured 2026-10-01). It is read when the library loads, so it can only come from the environment.
+cmd = "env OMP_WAIT_POLICY=PASSIVE bin/lidar3d_dds etc/config_helios_husky_webots.toml"
 ice_name = "Lidar3D:tcp -h localhost -p 11990"
 
 # Bridges the Webots IMU (bridge's Endpoints.IMU = 10007) onto the DDS media plane

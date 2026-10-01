@@ -20,7 +20,7 @@
 // openfield_concept — robot localization in an OPEN FIELD; the room_concept replacement for
 // agricultural worlds. GPS (bridge, Ice) + IMU (media plane) + wheel odometry (robot node) are fused
 // by an SE(2) EKF (openfield_ekf.h), and the result is published with room_concept's exact DSR
-// contract: a "room" node carrying the field polygon and the robot->room RT edge.
+// contract, with a "field" node (not "room") carrying the field polygon and the robot->field RT edge.
 
 #ifndef SPECIFICWORKER_H
 #define SPECIFICWORKER_H
@@ -29,6 +29,7 @@
 
 #include "openfield_ekf.h"
 #include "openfield_scene_graph.h"
+#include "openfield_viewer.h"
 
 #include "../../common/agent_presence_coordinator/agent_presence_coordinator.h"
 #include "../../common/concept_presence/concept_presence.h"
@@ -82,6 +83,7 @@ private:
 		int imu_stall_timeout_ms = 2000;           // primary-input gate (rc::stream)
 		std::string imu_node = "imu";
 		std::string csv_path = "tmp/openfield_pose.csv";
+		bool viewer = true;                        // Viewer.Enabled: the localization window
 	} cfg_;
 	void load_config();
 
@@ -121,8 +123,19 @@ private:
 	// GPS (bridge, Ice).
 	std::int64_t last_gps_poll_ms_ = 0;
 	std::optional<Eigen::Vector2d> last_gps_xy_;
-	std::uint64_t gps_fixes_ = 0;
+	std::uint64_t gps_fixes_ = 0, gps_fused_ = 0;
+	std::int64_t last_gps_new_ms_ = 0;         // wall ms of the last NEW fix
+	double last_gps_innovation_m_ = 0.0;
 	void poll_gps();
+
+	// ── Sensor switches (the window): take the GPS / the IMU's absolute yaw out of the filter ─────
+	bool gps_enabled_ = true;
+	bool yaw_enabled_ = true;
+	std::int64_t gps_off_since_ms_ = 0;        // 0 while the GPS is on
+	std::unique_ptr<rc::openfield::OpenFieldViewer> viewer_;
+	std::int64_t start_ms_ = 0;
+	std::uint64_t compute_ticks_ = 0;
+	void push_viewer();
 
 	// ── Estimation and publication ───────────────────────────────────────────────────────────────
 	rc::openfield::OpenFieldEkf ekf_;
@@ -134,6 +147,9 @@ private:
 
 	// ── Diagnostics ──────────────────────────────────────────────────────────────────────────────
 	std::ofstream csv_;
+	// Ground truth graded at its own stamp (see pose_history_). Simulation only.
+	struct GtError { Eigen::Vector3d gt; double err_xy = 0, err_theta = 0; bool stamped = false; };
+	[[nodiscard]] std::optional<GtError> gt_error() const;
 	// Published poses by timestamp, so the ground truth is graded at ITS OWN instant. It arrives at the
 	// base's 10 Hz; comparing it with the newest estimate instead charged up to 100 ms of motion to the
 	// filter (2.9 deg at 0.5 rad/s), which is the comparison's error, not the localizer's.

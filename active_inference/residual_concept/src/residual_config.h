@@ -57,6 +57,7 @@ struct ResidualConfig
     // ── ZED dense-depth boost: when a residual box is in the ZED FoV, backproject the depth in its image
     //    region and add those dense points to the belief likelihood (a much denser signal than LiDAR). ──
     bool          zed_boost_enabled = true;
+    std::string   zed_dump_csv_path;   // ZedBoost.DumpCsvPath: raw back-projected ZED FoV, debug (empty = off)
     float         zed_sigma_m       = 0.02f;   // per-ZED-point obs noise std (m) → R (ZED close depth is crisp)
     ZedBoostParams zed_boost;                  // subsample / margins / depth range / cap
     // Feed the dense ZED FoV cloud into DETECTION (clustering). Safe once the dense floor/wall subtraction is
@@ -154,6 +155,11 @@ struct ResidualConfig
     // the grid, so any inflation here is added twice. See the note at gp.inflate_radius_m.
     float grid_inflate_radius_m = 0.0f;
     float grid_self_body_radius_m = 0.55f;
+    // "disc" (default, the historical body model: a disc of SelfBodyRadiusM around the LiDAR) or "robot": the
+    // robot's own footprint (body node width_m/depth_m, measured from its mesh by robot_concept) + margin, as
+    // an oriented box centred on the robot. Use "robot" whenever a sensor is NOT on the robot's axis.
+    std::string grid_self_body_shape = "disc";
+    float grid_self_body_margin_m = 0.05f;
     float grid_self_body_sigma_m  = 0.08f;  // positional uncertainty of the body surface (probit width)
     bool  grid_pose_precision     = true;   // weight evidence by the localiser's own σ (see OccGridParams)
     // ── TIGHTENING THE OCCUPIED CONDITION (see OccGridParams for the derivations) ──

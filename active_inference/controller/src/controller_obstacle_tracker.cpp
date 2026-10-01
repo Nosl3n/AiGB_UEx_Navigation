@@ -1,3 +1,4 @@
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "controller_obstacle_tracker.h"
 
 #include "../../common/robot_footprint/robot_footprint.h"
@@ -861,7 +862,7 @@ ControllerPolygons ControllerObstacleTracker::read_obstacle_polygons(std::uint64
             // which is the least likely case to be tested and the worst one to fail in.
             // Excluded by identity, not by type, because room_concept's node type has changed before.
             if (graph_state_->room_id != 0 and node.id() == graph_state_->room_id) continue;
-            if (node.name() == graph_state_->room_name or node.type() == "room") continue;
+            if (node.name() == graph_state_->room_name or rc::world::is_frame_type(node.type())) continue;
             // ...and the same for every other node that carries an extent WITHOUT being a thing to avoid.
             // ★ THE FLOOR IS THE ONE THAT BIT US. room_concept publishes a node named "floor" whose
             // width_m/depth_m are the WHOLE ROOM's extent (room_scene_graph.cpp:887) purely so a viewer can
@@ -873,7 +874,7 @@ ControllerPolygons ControllerObstacleTracker::read_obstacle_polygons(std::uint64
             // hulls arrive separately, already shaped.
             // Matched by type AND name, because these node types have been renamed before in this codebase
             // and a silent miss here disables navigation completely rather than degrading it.
-            static constexpr std::array<const char *, 5> kNotObstacles = {"floor", "wall", "plane", "grid", "room"};
+            static constexpr std::array<const char *, 6> kNotObstacles = {"floor", "wall", "plane", "grid", "room", "field"};
             const auto is_infrastructure = [&](const auto &n)
             {
                 for (const char *t : kNotObstacles)
@@ -1165,6 +1166,36 @@ ControllerPolygons ControllerObstacleTracker::read_obstacle_polygons(std::uint64
             surviving_obstacles.push_back(std::move(temporary_obstacles_[index]));
         }
         temporary_obstacles_ = std::move(surviving_obstacles);
+    }
+
+    // ── PEOPLE: one disc per `person` node (human_concept), Controller.PersonRadiusM ──────────────────
+    // A person is avoided because retina + human_concept SAY there is a person, not only because residual has
+    // occupancy there: residual's cells of a walking person lag behind it, and the torso sits above the LiDAR's
+    // obstacle band. The disc is the body plus the room to leave a human; the planner then adds the robot's own
+    // footprint, exactly as for any other obstacle. Nearest-in-time pose: a person's RT edge is written at the
+    // skeleton rate, and an interpolated query past its newest sample would drop the person altogether.
+    if (params_ != nullptr and params_->person_radius_m > 0.f)
+    {
+        int n_people = 0;
+        for (const auto &person : graph_->get_nodes_by_type("person"))
+        {
+            const auto t = inner_eigen_api_->transform(graph_state_->room_name, person.name(), 0);
+            if (not t.has_value() or not t->allFinite())
+                continue;
+            const Eigen::Vector2f c(static_cast<float>(t->x()), static_cast<float>(t->y()));
+            ControllerPolygon disc;
+            constexpr int kSides = 12;
+            for (int k = 0; k < kSides; ++k)
+            {
+                const float a = 2.f * static_cast<float>(M_PI) * static_cast<float>(k) / kSides;
+                disc.emplace_back(c + params_->person_radius_m * Eigen::Vector2f(std::cos(a), std::sin(a)));
+            }
+            obstacles.push_back(disc);
+            display_obstacle_polygons_.push_back(ControllerObstacleVisual{
+                .polygon = disc, .kind = ControllerObstacleKind::Object, .label = "person"});
+            ++n_people;
+        }
+        report << " | people=" << n_people << " @r=" << params_->person_radius_m << "m";
     }
 
     // ── residual_concept OCCUPANCY GRID: TAKEN AS CELLS, NOT AS POLYGONS ─────────────────────────

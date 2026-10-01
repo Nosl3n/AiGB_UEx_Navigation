@@ -16,6 +16,7 @@
  *    You should have received a copy of the GNU General Public License
  *    along with RoboComp.  If not, see <http://www.gnu.org/licenses/>.
  */
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include <print>
 #include "specificworker.h"
 
@@ -552,6 +553,22 @@ void SpecificWorker::initialize()
 	refresh_mission_list();
 	update_custom_widget(std::nullopt);
 
+	// ── ARM ON START (opt-in, default OFF) ───────────────────────────────────────────────────────
+	// Exactly what pressing Run does in affordance/target mode: arm the base output and let whatever is
+	// driving, drive. For headless runs (no window to press Run in) whose goal arrives through the
+	// graph (Target.EdgeType). OFF by default because a controller that starts driving the moment it
+	// sees a target is a different safety posture from one that waits for a person.
+	bool arm_on_start = false;
+	try { arm_on_start = configLoader.get<bool>("Controller.ArmOnStart"); } catch (...) {}
+	if (arm_on_start)
+	{
+		paused_ = false;
+		motion_commander_.set_output_enabled(true);
+		driving_enabled_ = true;
+		std::println("[controller] ARMED ON START (Controller.ArmOnStart = true): will drive to any target "
+		             "without Run being pressed.");
+	}
+
     //initializeCODE
     /////////GET PARAMS, OPEND DEVICES....////////
     //int period = configLoader.get<int>("Period.Compute") //NOTE: If you want get period of compute use getPeriod("compute")
@@ -867,6 +884,7 @@ void SpecificWorker::load_params()
 	load_optional_cast<double>("Controller.SharpTurnSlowdown", params.sharp_turn_slowdown);
 	load_optional_cast<double>("Controller.MaxRotSpeed", params.max_rot_speed_rps);
 	load_optional_cast<double>("Controller.FootprintSafetyMarginM", params.footprint_safety_margin_m);
+	load_optional_cast<double>("Controller.PersonRadiusM", params.person_radius_m);
 	load_optional_cast<double>("Controller.PoseUncertaintyCoupling", params.pose_uncertainty_coupling);
 	load_optional("Controller.TrackerUsesLatestPose", params.tracker_uses_latest_pose);
 	// Clearance PREFERENCE inside the A* cost (grid_planner.h). Distinct from FootprintSafetyMarginM,
@@ -1195,7 +1213,7 @@ void SpecificWorker::modify_node_slot(std::uint64_t id, const std::string &type)
 	// connect note in initialize). LiDAR is NOT read from the graph (media plane only),
 	// so there is no "laser" handling here.
 	(void)id;
-	if (type == "room" or type == "robot")
+	if (rc::world::is_frame_type(type) or type == "robot")
 		hibernationTick();
 }
 

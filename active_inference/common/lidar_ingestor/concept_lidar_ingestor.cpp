@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "../media_transport/lidar_plane_reader.h"
+#include "../world_frame/world_frame.h"
 
 namespace rc
 {
@@ -38,6 +39,9 @@ bool ConceptLidarIngestor::pump()
     bpearl_fresh_ = false;
 
     const LidarGates g = gates_ ? gates_() : LidarGates{};
+    // The world frame the sweeps land in: "room" indoors, "field" outdoors (rc::world). Indoor agents are
+    // unchanged — with no field node frame_name() returns "room", the name this used to hard-code.
+    const std::string world = rc::world::frame_name(*G_);
 
     // Newest "helios" sweep, transformed into the ROOM frame at its capture stamp
     // (interpolate=true — a rotating robot's room<-robot pose differs from the latest pose). enabled follows the
@@ -45,7 +49,7 @@ bool ConceptLidarIngestor::pump()
     if (reader_)
     {
         const bool en = g.helios_precision > 0.0f or g.free_space_precision > 0.0f;
-        if (const auto sweep = reader_->poll("room", /*interpolate=*/true, /*enabled=*/en);
+        if (const auto sweep = reader_->poll(world, /*interpolate=*/true, /*enabled=*/en);
             sweep.has_value() and not sweep->points.empty())
         {
             sweep_room_   = std::move(sweep->points);
@@ -56,7 +60,7 @@ bool ConceptLidarIngestor::pump()
     // Low bpearl plane — its OWN capture stamp, its OWN origin. Only pumped while its feature is on.
     if (reader_bpearl_)
     {
-        if (const auto bp = reader_bpearl_->poll("room", /*interpolate=*/true,
+        if (const auto bp = reader_bpearl_->poll(world, /*interpolate=*/true,
                                                  /*enabled=*/g.bpearl_precision > 0.0f);
             bp.has_value() and not bp->points.empty())
         {

@@ -1,3 +1,4 @@
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "scene_processor.h"
 
 #include "rgbd_data.h"
@@ -136,7 +137,7 @@ std::pair<std::string, std::string> SceneProcessor::get_room_robot_names_for_com
 
     if (room_name_snapshot.empty())
     {
-        if (const auto room_nodes = graph_->get_nodes_by_type("room"); !room_nodes.empty())
+        if (const auto room_nodes = rc::world::frame_nodes(*graph_); !room_nodes.empty())
             room_name_snapshot = room_nodes.front().name();
     }
 
@@ -521,7 +522,7 @@ std::optional<SceneProcessor::RoomPolygonData> SceneProcessor::get_room_polygon_
 
     if (room_name_snapshot.empty())
     {
-        if (const auto room_nodes = graph_->get_nodes_by_type("room"); !room_nodes.empty())
+        if (const auto room_nodes = rc::world::frame_nodes(*graph_); !room_nodes.empty())
             room_name_snapshot = room_nodes.front().name();
     }
 

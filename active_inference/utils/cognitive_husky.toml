@@ -5,7 +5,7 @@
 #
 # Order follows the DSR dependency graph:
 #   robot_concept (bootstraps the graph from husky.json) -> openfield_concept (GPS+IMU+wheels pose,
-#   the room_concept replacement) -> controller / residual (later, F5).
+#   the room_concept replacement, publishes the `field` node) -> residual -> controller (last).
 
 [[components]]
 name = "robot_concept"
@@ -15,4 +15,29 @@ cmd  = "bin/robot_concept etc/config_husky.toml"
 [[components]]
 name = "openfield_concept"
 cwd  = "~/robocomp/AiGB_UEx_Navigation/active_inference/openfield_concept"
-cmd  = "bin/openfield_concept etc/config.toml"   # GPS+IMU+wheels EKF -> room node + robot->room RT
+cmd  = "bin/openfield_concept etc/config.toml"   # GPS+IMU+wheels EKF -> field node + robot->field RT
+
+# Null-hypothesis safety layer: every LiDAR/ZED return no concept explains becomes occupancy (the palms,
+# for now — there is no agricultural concept yet). Needs openfield_concept's `field` node.
+[[components]]
+name = "residual"
+cwd  = "~/robocomp/AiGB_UEx_Navigation/active_inference/residual_concept"
+cmd  = "bin/residual_concept etc/config_husky.toml"
+
+# Last: plans on the field polygon + residual's occupancy and drives the base (click a goal in its 2D view).
+[[components]]
+name = "controller"
+cwd  = "~/robocomp/AiGB_UEx_Navigation/active_inference/controller"
+cmd  = "bin/controller etc/config_husky.toml"
+
+# People (part 1 of retina in the field): ZED -> YOLO-seg + YOLO-pose -> 'masks' and 'skeleton' nodes.
+[[components]]
+name = "retina"
+cwd  = "~/robocomp/AiGB_UEx_Navigation/active_inference/retina"
+cmd  = "bin/retina etc/config_husky.toml"
+
+# BODY_18 skeletons from retina -> one person_* node per tracked person, placed in the field frame.
+[[components]]
+name = "human_concept"
+cwd  = "~/robocomp/AiGB_UEx_Navigation/active_inference/human_concept"
+cmd  = "bin/human_concept etc/config.toml"

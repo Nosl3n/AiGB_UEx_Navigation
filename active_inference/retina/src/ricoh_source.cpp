@@ -1,3 +1,4 @@
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "ricoh_source.h"
 #include "scene_processor.h"
 
@@ -47,7 +48,7 @@ std::optional<PerceptionFrame> RicohSource::operator()()
     if (inner_eigen_ && graph_)
     {
         std::string room_name;
-        if (const auto rooms = graph_->get_nodes_by_type("room"); !rooms.empty())
+        if (const auto rooms = rc::world::frame_nodes(*graph_); !rooms.empty())
             room_name = rooms.front().name();
         if (!room_name.empty())
             if (auto T = inner_eigen_->get_transformation_matrix(room_name, "ricoh", stamp); T.has_value())

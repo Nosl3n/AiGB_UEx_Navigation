@@ -16,6 +16,7 @@
 #ifndef SPECIFICWORKER_H
 #define SPECIFICWORKER_H
 
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -85,6 +86,10 @@ private:
     void on_optional_peer_ready(const std::string& name, std::uint32_t id);
     // Delete every "residual_*" obstacle node this agent owns (startup sweep + teardown).
     void remove_owned_residual_nodes();
+    // The robot's own footprint this cycle (Grid.SelfBodyShape = "robot"): oriented box in the world frame.
+    struct SelfBox { bool valid = false; Eigen::Vector2f c = Eigen::Vector2f::Zero(); float yaw = 0, hw = 0, hd = 0; };
+    SelfBox self_box_;
+    void update_self_box();
 
     // A modelled horizontal support surface (a tabletop): its top-z and oriented footprint. An obstacle
     // whose observed bottom is at/above this surface, over its footprint, is assumed to REST on it.
@@ -214,6 +219,7 @@ private:
     std::unique_ptr<DSR::InnerEigenAPI>    inner_eigen_;
     std::unique_ptr<DSR::InnerGaussianAPI> gaussian_api_;
     std::uint64_t                          room_node_id_ = 0;
+    rc::world::FrameCache                  world_;   // name of the world frame ("room" or "field")
 
     // Soft-collapse descriptor per modelled object (table/chair/cylinder): 2D footprint + top height + the σ's
     // from the object's OWN published position covariance (⊕ sensor noise). A grid cell is explained by an

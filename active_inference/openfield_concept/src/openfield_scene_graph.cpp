@@ -30,9 +30,9 @@ bool OpenFieldSceneGraph::ensure_room(const std::vector<Eigen::Vector2f> &polygo
     std::vector<float> px, py;
     for (const auto &v : polygon) { px.push_back(v.x()); py.push_back(v.y()); }
 
-    // ADOPT: a room node may survive from a previous run (persisted graph) or a crashed one. Make sure
+    // ADOPT: a field node may survive from a previous run (persisted graph) or a crashed one. Make sure
     // it carries OUR polygon — every consumer's containment prior reads it.
-    if (const auto rooms = G_->get_nodes_by_type("room"); not rooms.empty())
+    if (const auto rooms = G_->get_nodes_by_type("field"); not rooms.empty())
     {
         auto rn = rooms.front();
         room_id_ = rn.id();
@@ -40,13 +40,14 @@ bool OpenFieldSceneGraph::ensure_room(const std::vector<Eigen::Vector2f> &polygo
         G_->add_or_modify_attrib_local<delimiting_polygon_y_att>(rn, py);
         G_->add_or_modify_attrib_local<room_height_att>(rn, room_height);
         G_->update_node(rn);
-        qInfo() << "[openfield] adopted existing room node" << room_id_ << "and set its polygon ("
+        qInfo() << "[openfield] adopted existing field node" << room_id_ << "and set its polygon ("
                 << static_cast<int>(px.size()) << "vertices)";
         return true;
     }
 
-    // Must be NAMED "room": residual_concept resolves the world frame by that literal name.
-    DSR::Node room = DSR::Node::create<room_node_type>("room");
+    // Type AND name `field`: the open-field world frame (cortex dsr_node_type.h). Consumers find it through
+    // common/world_frame (rc::world::frame_node), which prefers `field` and falls back to `room`.
+    DSR::Node room = DSR::Node::create<field_node_type>("field");
     G_->add_or_modify_attrib_local<delimiting_polygon_x_att>(room, px);
     G_->add_or_modify_attrib_local<delimiting_polygon_y_att>(room, py);
     // Outdoors there is no ceiling; this is the obstacle-cloud ceiling consumers crop the LiDAR with.
@@ -57,11 +58,11 @@ bool OpenFieldSceneGraph::ensure_room(const std::vector<Eigen::Vector2f> &polygo
     const auto id = G_->insert_node(room);
     if (not id.has_value())
     {
-        qWarning() << "[openfield] failed to insert the room node";
+        qWarning() << "[openfield] failed to insert the field node";
         return false;
     }
     room_id_ = id.value();
-    qInfo() << "[openfield] room node created, id" << room_id_ << "," << static_cast<int>(px.size())
+    qInfo() << "[openfield] field node created, id" << room_id_ << "," << static_cast<int>(px.size())
             << "vertices, height" << room_height << "m";
     return true;
 }

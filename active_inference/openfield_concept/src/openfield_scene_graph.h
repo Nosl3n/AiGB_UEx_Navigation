@@ -1,10 +1,11 @@
-// openfield_scene_graph.h — the DSR side of openfield_concept: the "room" node and the robot->room RT.
+// openfield_scene_graph.h — the DSR side of openfield_concept: the "field" node and the robot->field RT.
 //
-// ★ THE CONTRACT IS room_concept's, BYTE FOR BYTE, and on purpose: controller, residual_concept and
-// every object agent find the world frame as the node of TYPE "room" NAMED "room" and read the robot
-// pose through the RT edge robot->room (active_inference/field_concept.md §1.2). Matching it exactly
-// is what lets openfield_concept replace room_concept with a config change in the consumers and no code
-// change. The edge writer is a port of RoomSceneGraph::write_robot_room_rt
+// ★ THE CONTRACT IS room_concept's, BYTE FOR BYTE, with one difference: the world-frame node is of TYPE
+// and NAME `field` (cortex dsr_node_type.h), not `room`. Consumers resolve it through
+// common/world_frame (rc::world::frame_node / FrameCache), which accepts either, so controller and
+// residual_concept drive on a field exactly as they do in a room: same delimiting_polygon_x/y, same
+// room_height, same RT edge layout robot->world. The edge writer is a port of
+// RoomSceneGraph::write_robot_room_rt
 // (room_concept/src/room_scene_graph.cpp); read the comments there before changing any index or sign —
 // each one records a bug that already cost a measurement to find:
 //   * the edge is parent=ROBOT, child=ROOM, so it stores T_robot<-room (the INVERSE of the pose), and the

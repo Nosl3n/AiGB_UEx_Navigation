@@ -2,6 +2,7 @@
  * human_fitter.cpp — per-person active-inference fit wrapping the cpp/core estimator.
  */
 
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "human_fitter.h"
 
 #include <algorithm>
@@ -85,13 +86,18 @@ bool HumanFitter::ensure_instance(const DSR::Node& node, std::uint64_t room_node
     else
         inst.track_id = track_id_from_name(node.name());
     inst.parent_id   = room_node_id;
-    inst.parent_name = "room";
+    inst.parent_name = rc::world::frame_name(*G_);   // "room" indoors, "field" outdoors
     inst.affordance.init(G_, node.id(), node.name(), "person");
 
     // Estimator references the PER-INSTANCE model (own, online-calibrated bone lengths). Build it AFTER
     // the instance is in the map so it binds the in-map model address (stable under unordered_map).
     const auto it = instances_.emplace(node.id(), std::move(inst)).first;
     HumanInstance& m = it->second;
+    // Born now: the absence clock starts at birth, so a track seen once and never again still retires.
+    m.last_seen_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch()).count();
+    m.last_evidence_ms = m.last_fix_ms = m.last_seen_ms;
+    m.existence = rc::exist::ExistenceBelief(cfg_.exist_l0, cfg_.exist_l_max);
     m.estimator = std::make_unique<human::AInfLaplacePoseEstimator>(m.model, make_infer_config());
     std::print("human_concept: instance for '{}' id={} track={}\n",
                node.name(), node.id(), m.track_id);
@@ -159,6 +165,8 @@ float HumanFitter::run_inference(HumanInstance& inst, const HumanObservation& ob
         inst.has_result  = true;
         ++inst.matched_frames;
         inst.frames_since_detection = 0;
+        inst.last_seen_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
         inst.last_mask_confidence   = obs.mean_conf;
 
         // Output controller — drive the published command angles toward the belief target (theta* =

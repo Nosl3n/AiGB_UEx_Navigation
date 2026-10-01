@@ -10,6 +10,7 @@ or with webots --batch --mode=fast. Uses the SAME skid-steer IK/FK the bridge us
 Robot frame: +Y forward, +X right, +Z up. Positive w = counter-clockwise seen from above.
 """
 import math
+import os
 import sys
 
 from controller import Supervisor
@@ -68,6 +69,14 @@ def main():
         return
 
     sup.step(dt_ms)
+    # Optional: SELFTEST_SNAPSHOT=/path/view.jpg saves the 3D view at start (needs rendering on).
+    if snap := os.environ.get("SELFTEST_SNAPSHOT"):
+        for _ in range(20):
+            sup.step(dt_ms)
+        sup.exportImage(snap, 90)
+        cam = os.path.splitext(snap)[0] + "_zed.jpg"
+        devices["zed"].saveImage(cam, 90)
+        print(f"[selftest] snapshot -> {snap}, {cam}", flush=True)
     prev = [s.getValue() for s in enc]
     ox, oy, oth = 0.0, 0.0, yaw_of(me)
     p0 = me.getPosition()

@@ -69,8 +69,8 @@ Robot.Def = "husky"
 # (gpsAccuracy / gpsNoiseCorrelation), not here.
 GPS.Period = 100
 
-# IMU orientation now comes from the proto's InertialUnit (noise 0.002 rad), not the supervisor.
-IMU.NominalOrientVar = 4e-6
+# IMU orientation now comes from the proto's InertialUnit (imuNoiseRad 0.003 rad std), not the supervisor.
+IMU.NominalOrientVar = 9e-6
 
 # Source of the VELOCITY fields published on FullPoseEstimationPub. The pose fields are supervisor
 # ground truth either way, and OmniRobot is unaffected by this setting.

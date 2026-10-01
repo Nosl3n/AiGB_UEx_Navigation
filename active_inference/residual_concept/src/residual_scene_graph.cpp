@@ -2,6 +2,7 @@
  * residual_scene_graph.cpp — DSR node/RT I/O for residual_concept.
  */
 
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "residual_scene_graph.h"
 
 #include <algorithm>
@@ -208,13 +209,13 @@ void ResidualSceneGraph::write_rt_pose(ResidualInstance& inst, std::uint64_t roo
         if (chain_cov_enabled_ and gaussian_ and inner_eigen_)
         {
             const Mat::Vector3d centre_room(s.cx, s.cy, s.cz);
-            if (const auto c_src = inner_eigen_->transform(chain_src_frame_, centre_room, "room", timestamp_ms);
+            if (const auto c_src = inner_eigen_->transform(chain_src_frame_, centre_room, world_.name(*G_), timestamp_ms);
                 c_src.has_value())
             {
                 DSR::GaussianPoint3D gp;
                 gp.mean = c_src.value();
                 gp.covariance = DSR::Cov3d::Zero();
-                if (const auto g_fit = gaussian_->transform_point("room", gp, chain_src_frame_, timestamp_ms);
+                if (const auto g_fit = gaussian_->transform_point(world_.name(*G_), gp, chain_src_frame_, timestamp_ms);
                     g_fit.has_value())
                 {
                     const auto& C = g_fit.value().covariance;

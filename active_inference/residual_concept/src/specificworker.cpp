@@ -7,6 +7,7 @@
  * SpecificWorker — residual_concept: lifecycle + presence + orchestration.
  */
 
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
 #include "specificworker.h"
 
 #include <cstdlib>
@@ -204,9 +205,9 @@ void SpecificWorker::initialize()
 
     remove_owned_residual_nodes();
 
-    const auto rooms = G->get_nodes_by_type("room");
-    if (not rooms.empty()) room_node_id_ = rooms.front().id();
-    else                   qWarning() << "residual_concept: no room node found at startup";
+    // The world frame: `room` indoors, `field` outdoors (openfield_concept) — same contract.
+    if (const auto frame = rc::world::frame_node(*G); frame.has_value()) room_node_id_ = frame->id();
+    else qWarning() << "residual_concept: no world-frame node (room/field) found at startup";
 }
 
 std::vector<rc::SpecialistSdf> SpecificWorker::build_specialist_sdfs() const
@@ -236,7 +237,7 @@ std::vector<rc::SpecialistSdf> SpecificWorker::build_specialist_sdfs() const
                 if (log_skip) std::println("[collapse-skip] '{}' w={:.2f} d={:.2f} h={:.2f} (needs all >0)", n.name(), w, d, h);
                 continue;
             }
-            const auto T = inner_eigen_->get_transformation_matrix("room", n.name(), 0);
+            const auto T = inner_eigen_->get_transformation_matrix(world_.name(*G), n.name(), 0);
             if (not T.has_value())
             {
                 if (log_skip) std::println("[collapse-skip] '{}' no room→object transform", n.name());
@@ -297,7 +298,7 @@ void SpecificWorker::build_support_surfaces()
         const float h = G->get_attrib_by_name<height_m_att>(n).value_or(0.0f);
         if (w <= 0.0f or d <= 0.0f or h <= 0.0f)
             continue;
-        const auto T = inner_eigen_->get_transformation_matrix("room", n.name(), 0);
+        const auto T = inner_eigen_->get_transformation_matrix(world_.name(*G), n.name(), 0);
         if (not T.has_value())
             continue;
         const auto& M = T.value().matrix();
@@ -330,6 +331,32 @@ float SpecificWorker::support_z_for(float cx, float cy, float z_min) const
     return support;
 }
 
+// The robot's own footprint in the world frame, this cycle. Size = the body node's width_m / depth_m, which
+// robot_concept MEASURES from the robot's mesh (so the ZED, the mast and the bumpers are all inside it), grown
+// by Grid.SelfBodyMarginM. Pose = world <- body. Invalid (=> the disc fallback) if any of it is missing.
+void SpecificWorker::update_self_box()
+{
+    self_box_.valid = false;
+    if (cfg_.grid_self_body_shape != "robot" or not G or not inner_eigen_)
+        return;
+    const auto body = G->get_node("body");
+    if (not body.has_value())
+        return;
+    const float w = G->get_attrib_by_name<width_m_att>(body.value()).value_or(0.0f);
+    const float d = G->get_attrib_by_name<depth_m_att>(body.value()).value_or(0.0f);
+    if (w <= 0.0f or d <= 0.0f)
+        return;
+    const auto T = inner_eigen_->get_transformation_matrix(world_.name(*G), "body", 0);
+    if (not T.has_value())
+        return;
+    const auto &M = T.value();
+    self_box_.c   = Eigen::Vector2f(static_cast<float>(M(0, 3)), static_cast<float>(M(1, 3)));
+    self_box_.yaw = static_cast<float>(std::atan2(M(1, 0), M(0, 0)));
+    self_box_.hw  = 0.5f * w + cfg_.grid_self_body_margin_m;
+    self_box_.hd  = 0.5f * d + cfg_.grid_self_body_margin_m;
+    self_box_.valid = true;
+}
+
 std::vector<rc::SpecialistExplainer> SpecificWorker::build_explainers(
     const Eigen::Vector2f& robot_xy, const std::vector<rc::SpecialistSdf>& objects) const
 {
@@ -352,9 +379,21 @@ std::vector<rc::SpecialistExplainer> SpecificWorker::build_explainers(
     // 1: ROOM CEILING — overhead structure above the navigation band.
     const float cz = C.ceil_z;
     ex.push_back([cz](const Eigen::Vector3f& p) { return p.z() > cz; });
-    // 2: ROBOT — its own body returns.
-    const float rr2 = C.robot_radius_m * C.robot_radius_m;
-    ex.push_back([rr2, robot_xy](const Eigen::Vector3f& p) { return (p.head<2>() - robot_xy).squaredNorm() < rr2; });
+    // 2: ROBOT — its own body returns. The robot's oriented footprint when it is known (Grid.SelfBodyShape =
+    //    "robot"), else the historical disc of RobotRadiusM around the LiDAR origin.
+    if (self_box_.valid)
+    {
+        const auto b = self_box_;
+        const float c = std::cos(b.yaw), s = std::sin(b.yaw);
+        ex.push_back([b, c, s](const Eigen::Vector3f& p)
+                     { const float dx = p.x() - b.c.x(), dy = p.y() - b.c.y();
+                       return std::abs(c * dx + s * dy) < b.hw and std::abs(-s * dx + c * dy) < b.hd; });
+    }
+    else
+    {
+        const float rr2 = C.robot_radius_m * C.robot_radius_m;
+        ex.push_back([rr2, robot_xy](const Eigen::Vector3f& p) { return (p.head<2>() - robot_xy).squaredNorm() < rr2; });
+    }
     // 3: ROOM WALLS — the room_concept delimiting polygon. A return outside the room, or within wall_margin of
     //    a wall edge, is explained by the room's wall model.
     const auto poly = read_room_polygon();
@@ -412,7 +451,7 @@ void SpecificWorker::log_phantom_event(std::string_view event, std::uint64_t id,
     // Observer pose → view bearing: the classifier failure is VIEWPOINT-dependent, so the eventual p_FA field
     // is keyed on (world cell × bearing), never place alone.
     if (inner_eigen_)
-        if (const auto rtb = inner_eigen_->get_transformation_matrix("room", "body", 0); rtb.has_value())
+        if (const auto rtb = inner_eigen_->get_transformation_matrix(world_.name(*G), "body", 0); rtb.has_value())
         {
             const auto& Tm = rtb.value();
             e.robot_x = static_cast<float>(Tm(0, 3));
@@ -647,9 +686,9 @@ void SpecificWorker::compute()
         return;
     if (room_node_id_ == 0)
     {
-        const auto rooms = G->get_nodes_by_type("room");
-        if (rooms.empty()) return;
-        room_node_id_ = rooms.front().id();
+        const auto frame = rc::world::frame_node(*G);
+        if (not frame.has_value()) return;
+        room_node_id_ = frame->id();
     }
 
     // Fresh LiDAR sweep is the only trigger — no sweep, no re-cluster this cycle (instances persist).
@@ -754,6 +793,12 @@ void SpecificWorker::compute()
             // does. Radius matches the lidar driver's [Footprint] disc so both agree on ONE body model.
             grid_.set_self_body(lidar_ingestor_->origin_room().x(), lidar_ingestor_->origin_room().y(),
                                 cfg_.grid_self_body_radius_m);
+            // ...or the robot's REAL footprint, centred on the robot (see OccupancyGrid::set_self_box).
+            update_self_box();
+            if (self_box_.valid)
+                grid_.set_self_box(self_box_.c.x(), self_box_.c.y(), self_box_.yaw, self_box_.hw, self_box_.hd);
+            else
+                grid_.clear_self_box();
             // PER-DEVICE integration: each LiDAR carries its own floor sigma, taken from its own floor fit.
             // See integrate_lidar_per_device(). Falls back to one merged sweep when the per-device tag is
             // unavailable — in which case the single datum sigma applies to everything,
@@ -1077,7 +1122,7 @@ void SpecificWorker::integrate_zed_into_grid()
     if (not zed_ingestor_->has_depth()) return;
 
     // room←zed at the sweep stamp (Nearest — the camera pose moves with the robot).
-    const auto rt = inner_eigen_->get_transformation_matrix("room", "zed", current_ts_, "RT",
+    const auto rt = inner_eigen_->get_transformation_matrix(world_.name(*G), "zed", current_ts_, "RT",
                                                             DSR::RT_API::TimeQuery::Nearest);
     if (not rt.has_value()) return;
     const Eigen::Matrix4f room_T_cam = rt->matrix().cast<float>();
@@ -1087,6 +1132,23 @@ void SpecificWorker::integrate_zed_into_grid()
                                    room_T_cam, cfg_.zed_boost);
     if (pts.empty()) return;
     const Eigen::Vector3f cam_origin = room_T_cam.col(3).head<3>();
+    // Optional raw dump of the back-projected ZED FoV (world frame) — ZedBoost.DumpCsvPath, empty = off.
+    // For checking the depth geometry against the scene; one frame in every 20 so it stays small.
+    if (not cfg_.zed_dump_csv_path.empty())
+    {
+        static std::ofstream zd;
+        static std::uint64_t zk = 0;
+        if (not zd.is_open())
+        {
+            zd.open(cfg_.zed_dump_csv_path, std::ios::out | std::ios::trunc);   // DIAG-ROTATE: exempt (debug dump, opt-in)
+            zd.imbue(std::locale::classic());
+            zd << "frame,x,y,z,cam_x,cam_y,cam_z\n";
+        }
+        if ((zk++ % 20) == 0)
+            for (const auto &p : pts)
+                zd << zk << ',' << p.x() << ',' << p.y() << ',' << p.z() << ',' << cam_origin.x() << ','
+                   << cam_origin.y() << ',' << cam_origin.z() << '\n';
+    }
     // ROBUST infrastructure rejection BEFORE the grid: ZED stereo depth noise grows with range² (σ0+q·r²), so
     // the grid's fixed nav-band lets noisy floor points read as obstacles → phantom floor obstacles everywhere.
     // subtract_infrastructure removes floor/ceiling/walls with a k·σ(r) band (the same filter the old ZED
