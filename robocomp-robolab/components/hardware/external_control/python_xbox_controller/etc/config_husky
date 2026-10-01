@@ -20,6 +20,9 @@ joystickUniversal.Device = "/dev/input/js0"
 joystickUniversal.NumAxes = 2
 #                          name     axis  min    max   inverted  dead_zone
 joystickUniversal.Axis_0 = "advance, 1, -1000, 1000, true, 0.1"
+# Rotate on the RIGHT stick's horizontal axis (3), advance on the left stick: two-stick driving, so
+# a straight run is not disturbed by sideways drift of the left stick. (Axis 0, the left stick's
+# horizontal, is unused: config_shadow had "side" there, and a skid-steer cannot strafe.)
 joystickUniversal.Axis_1 = "rotate,  3,   -1,    1,  true, 0.1"
 
 joystickUniversal.NumButtons = 3

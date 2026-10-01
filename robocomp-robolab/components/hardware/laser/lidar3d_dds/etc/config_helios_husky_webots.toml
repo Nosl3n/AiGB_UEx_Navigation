@@ -17,8 +17,9 @@ Dilate = 0.05
 # The self-filter and consumer placement now share this ONE value (~1.03 m) — the mesh is accurate
 # (SolidWorks / printed robot), so no decouple is needed. If shadow.json can't be read, roll back to
 # the rx..tz fallback below (kept in sync at tz=1030).
-# No husky.json yet: the fallback extrinsics below are authoritative.
-# mount_file = "/home/nosl3n/robocomp/components/active_inference/robot_concept/husky.json"
+# Mount read from this repo's husky.json (body<-helios RT edge), the same file robot_concept seeds the
+# graph from, so the driver and the DSR cannot disagree about where the helios is.
+mount_file = "/home/nosl3n/robocomp/AiGB_UEx_Navigation/active_inference/robot_concept/husky.json"
 mount_key  = "helios"
 rx = -0.0
 # 2026-08-29: 0 -> pi. The helios is now mounted UPSIDE DOWN (wide part of the fan pointing UP, at
@@ -27,7 +28,7 @@ rx = -0.0
 # logs to stderr and carries on with these numbers, so leaving ry at 0 here would hand the mesh
 # self-filter an UPRIGHT sensor while the cloud arrives inverted — every self-return tested against
 # the wrong half of the robot. The 45 mm tz staleness below is the same failure mode, one axis over.
-ry = 3.14159265359   # fallback only; MUST equal shadow.json body<-helios euler_y
+ry = 0.0   # fallback only; MUST equal husky.json body<-helios euler_y (0: upright, like Shadow's sim mount)
 rz = 0.0
 tx = 0.0
 ty = -250.0      # HuskyA300.proto heliosTranslation 0 -0.25 0.95 (mm)
@@ -40,7 +41,7 @@ ty = -250.0      # HuskyA300.proto heliosTranslation 0 -0.25 0.95 (mm)
 # resurrect that failure invisibly. Verified against shadow.json 2026-08-01; bpearl's fallback was
 # already in sync. ★If shadow.json's mounts change, change these too — or better, make the rollback
 # refuse to start rather than proceed on numbers nobody checked.
-tz = 950.0
+tz = 950.0        # fallback only; MUST equal husky.json body<-helios z (0.95 m)
 
 [Proxies]
 # Proxies for required interfaces

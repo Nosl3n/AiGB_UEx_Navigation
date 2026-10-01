@@ -119,8 +119,10 @@ Todo esto debe quedar como parámetros del generador del mundo.
 |---|---|
 | F0 | pendiente (`WORLD/` sigue en su sitio; `webots-agri/` ya creado) |
 | F1 | ✅ hecho (falta confirmar medidas con el URDF del A300) |
-| F2 | ✅ bridge, GPS y configs hechos; falta `husky.json` para `robot_concept` |
-| F3–F7 | pendiente |
+| F2 | ✅ hecho (incluido `husky.json` y `robot_concept` para el Husky) |
+| F3 | pendiente |
+| F4 | ✅ `openfield_concept` funcionando (falta afinar covarianza y conectar controller/residual en F5) |
+| F5–F7 | pendiente |
 
 ### F1 — hecho (2026-09-30)
 - `webots-agri/protos/HuskyA300.proto`: skid-steer de 4 ruedas (`front_left`, `rear_left`,
@@ -164,9 +166,44 @@ Todo esto debe quedar como parámetros del generador del mundo.
 ### Pendiente de F1/F2
 - Confirmar medidas y masa del A300 con `clearpath_common` (a300.urdf.xacro) y ajustar los campos
   del PROTO y del STL de self-filter (el script tiene las mismas constantes).
-- `husky.json` para `robot_concept` (montajes de helios, zed, imu, gps) y `mount_calib_Husky.txt`;
-  entonces activar `mount_file` en el config del helios.
 - Medir el ruido de odometría del Husky parado (`SensorNoise.*Floor` viene del P3Bot).
 - En la prueba del helios, el driver bajó a ~2 Hz tras unos segundos: revisar si es la hibernación
   del bridge o el ritmo de la simulación con `--no-rendering`.
 - Límites de velocidad del joystick (`config_shadow`) frente a los 2 m/s del Husky.
+
+### F2 (cont.) — el Husky en el DSR (2026-09-30)
+- `active_inference/robot_concept/husky.json`: `root → husky (robot) → body → helios / zed / imu / gps`
+  (tipo `gps`, ya registrado en cortex) + `mind`; montajes = campos del PROTO.
+- `robot_concept/etc/config_husky.toml` + `etc/base_husky.toml` (capacidad de la base: diferencial,
+  1 m/s, 1,5 rad/s, R y vía del Husky) + `meshes/husky_a300.obj` (generado por
+  `webots-agri/tools/gen_husky_selffilter_stl.py`, el mismo que el STL del self-filter).
+- El helios lee su montaje de `husky.json` (`mount_file`). Corregido el valor de reserva `ry = π`
+  heredado del Shadow, que habría invertido la nube.
+- Probado: ZED y helios ~17 Hz, IMU ~121 Hz, odometría ~11 Hz; cuerpo medido del mesh 0,685 × 0,99 m.
+
+### F4 — `openfield_concept` (2026-09-30)
+- Agente DSR nuevo (`active_inference/openfield_concept`, **id 25**; el 18 y el 19 estaban en uso por
+  viewer3d y ltsm_agent sin figurar en la tabla de IDs de `CONCEPT_AGENT_RECIPE.md`: añadidos).
+- EKF SE(2) `[x, y, θ]` (`src/openfield_ekf.{h,cpp}`, solo Eigen, con `self_test()`):
+  predicción con avance de ruedas + giro del **giroscopio** (las ruedas del skid-steer sobreestiman el
+  giro); corrección con GPS (antena con brazo de palanca) y yaw absoluto de la IMU. Ruido de proceso
+  como densidad que crece con la velocidad, sin umbrales.
+- Publica el mismo contrato que `room_concept` (`src/openfield_scene_graph.cpp`, portado de
+  `RoomSceneGraph::write_robot_room_rt`): nodo `room` con el polígono del campo + arista RT
+  `robot→room` con covarianza en los índices 0/1/5 y twist del hijo.
+- Límite del campo en config: metros locales (`Field.PolygonX/Y`) o coordenadas GPS
+  (`Field.PolygonLat/Lon`, convertidas a UTM como el bridge).
+- Protocolo de presencia compartido (`common/concept_presence`); entrada principal = IMU; apagado
+  limpio (borra su nodo y el `room`).
+- `utils/cognitive_husky.toml`: `robot_concept` + `openfield_concept`.
+- **Resultado** (husky_test.wbt, recta 0,6 m/s + pivote 0,5 rad/s + arco, error frente a la GT al
+  instante de la GT): posición p50 2,2 cm / p95 5,0 cm / máx 6,8 cm; rumbo p50 0,07° / máx 0,19°.
+  50 Hz, 1–2 % de CPU.
+
+### Pendiente de F4
+- La covarianza publicada es ~2× optimista en posición (σ ≈ 1 cm frente a error p50 2,2 cm): el ruido
+  del GPS de Webots está correlacionado (`noiseCorrelation 0.9`) y el EKF lo trata como blanco.
+  Opciones: subir `Ekf.GpsSigmaM` o modelar el sesgo del GPS como estado (Gauss-Markov).
+- El interfaz `RoboCompGPS` no lleva marca de tiempo: cada fix se aplica al recibirlo (≤ 50 ms de
+  sondeo + 100 ms de periodo del receptor). Suficiente a 1 m/s con RTK; revisar si se sube la velocidad.
+- Conectar `controller` y `residual_concept` (`required_agent_names` → `openfield_concept`), F5.

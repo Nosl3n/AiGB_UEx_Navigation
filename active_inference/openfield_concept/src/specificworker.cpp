@@ -1,0 +1,467 @@
+/*
+ *    Copyright (C) 2026 by RoboLab at the University of Extremadura
+ *
+ *    This file is part of RoboComp
+ *
+ *    RoboComp is free software: you can redistribute it and/or modify
+ *    it under the terms of the GNU General Public License as published by
+ *    the Free Software Foundation, either version 3 of the License, or
+ *    (at your option) any later version.
+ *
+ *    RoboComp is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU General Public License for more details.
+ *
+ *    You should have received a copy of the GNU General Public License
+ *    along with RoboComp.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include "specificworker.h"
+
+#include "geo_utm.h"
+
+#include "../../common/agent_exit/terminal_exit.h"
+#include "../../common/diag_log/rotating_csv.h"
+#include "../../common/stream_gate/stream_gate.h"
+
+#include <QCoreApplication>
+#include <QDateTime>
+#include <algorithm>
+#include <cmath>
+#include <filesystem>
+#include <format>
+#include <locale>
+#include <print>
+
+using rc::openfield::wrap_pi;
+
+SpecificWorker::SpecificWorker(const ConfigLoader& configLoader, TuplePrx tprx, bool startup_check)
+    : GenericWorker(configLoader, tprx)
+{
+	this->startup_check_flag = startup_check;
+	if (this->startup_check_flag)
+	{
+		this->startup_check();
+		return;
+	}
+
+	load_config();
+
+	// The EKF is pure Eigen: prove it on a synthetic drive before trusting it with the robot.
+	if (std::string report; rc::openfield::OpenFieldEkf::self_test(&report))
+		std::println("{}", report);
+	else
+		qCritical("%s", report.c_str());
+	ekf_.set_params(cfg_.ekf);
+
+	// Agent-presence state machine: Waiting -> Operating -> Degraded (same shape as every concept agent).
+	const int period = configLoader.get<int>("Period.Compute");
+	states["Waiting"] = std::make_unique<GRAFCETStep>("Waiting", period,
+		std::bind(&SpecificWorker::waiting_loop, this), std::bind(&SpecificWorker::waiting_enter, this));
+	states["Operating"] = std::make_unique<GRAFCETStep>("Operating", period,
+		std::bind(&SpecificWorker::operating_loop, this), std::bind(&SpecificWorker::operating_enter, this));
+	states["Degraded"] = std::make_unique<GRAFCETStep>("Degraded", period,
+		std::bind(&SpecificWorker::degraded_loop, this), std::bind(&SpecificWorker::degraded_enter, this));
+
+	states["Compute"]->addTransition(states["Compute"].get(), SIGNAL(entered()), states["Waiting"].get());
+	states["Waiting"]->addTransition(this, SIGNAL(presenceReady()), states["Operating"].get());
+	states["Operating"]->addTransition(this, SIGNAL(presenceLost()), states["Degraded"].get());
+	states["Degraded"]->addTransition(states["Degraded"].get(), SIGNAL(entered()), states["Waiting"].get());
+
+	statemachine.addState(states["Waiting"].get());
+	statemachine.addState(states["Operating"].get());
+	statemachine.addState(states["Degraded"].get());
+	statemachine.setChildMode(QState::ExclusiveStates);
+	statemachine.start();
+	if (auto error = statemachine.errorString(); error.length() > 0)
+	{
+		qWarning() << error;
+		throw error;
+	}
+}
+
+SpecificWorker::~SpecificWorker()
+{
+	request_shutdown();
+}
+
+void SpecificWorker::load_config()
+{
+	const auto opt = [this](const std::string &key, auto &out)
+	{
+		try { out = configLoader.get<std::remove_reference_t<decltype(out)>>(key); } catch (...) {}
+	};
+	auto &e = cfg_.ekf;
+	opt("Ekf.AdvSigma0", e.adv_sigma0);
+	opt("Ekf.AdvSlip", e.adv_slip);
+	opt("Ekf.SideSigma0", e.side_sigma0);
+	opt("Ekf.SideSlip", e.side_slip);
+	opt("Ekf.GyroSigma0", e.gyro_sigma0);
+	opt("Ekf.GyroScale", e.gyro_scale);
+	opt("Ekf.GpsSigmaM", e.gps_sigma_m);
+	opt("Ekf.YawSigmaRad", e.yaw_sigma_rad);
+	std::vector<double> lever;
+	opt("Ekf.GpsLever", lever);
+	if (lever.size() == 2) e.gps_lever = {lever[0], lever[1]};
+
+	opt("Field.PolygonX", cfg_.poly_x);
+	opt("Field.PolygonY", cfg_.poly_y);
+	opt("Field.PolygonLat", cfg_.poly_lat);
+	opt("Field.PolygonLon", cfg_.poly_lon);
+	double h = cfg_.room_height;
+	opt("Field.RoomHeight", h);
+	cfg_.room_height = static_cast<float>(h);
+
+	opt("Imu.UseYaw", cfg_.use_imu_yaw);
+	opt("Imu.YawUpdatePeriodMs", cfg_.yaw_update_period_ms);
+	opt("Imu.StallTimeoutMs", cfg_.imu_stall_timeout_ms);
+	opt("Imu.Node", cfg_.imu_node);
+	opt("Gps.PollPeriodMs", cfg_.gps_poll_period_ms);
+	opt("Diag.CsvPath", cfg_.csv_path);
+
+	std::println("[openfield] EKF: gps sigma {} m, yaw sigma {} rad, lever ({}, {}) m | IMU yaw {} every {} ms",
+	             e.gps_sigma_m, e.yaw_sigma_rad, e.gps_lever.x(), e.gps_lever.y(),
+	             cfg_.use_imu_yaw ? "ON" : "OFF", cfg_.yaw_update_period_ms);
+}
+
+void SpecificWorker::initialize()
+{
+	GenericWorker::initialize();
+	if (not G)
+	{
+		qWarning() << "openfield_concept: DSR graph not available in initialize()";
+		return;
+	}
+	// This agent reads nothing heavy from the graph: drop the payload blobs peers publish.
+	G->set_ignored_attributes<cam_rgb_att, cam_depth_att, laser_X_att, laser_Y_att, laser_Z_att>();
+
+	rt_api_ = G->get_rt_api();
+	rt_api_->HISTORY_SIZE = 25;   // same ring depth as room_concept: consumers interpolate into it
+	scene_graph_ = std::make_unique<rc::openfield::OpenFieldSceneGraph>(G, rt_api_.get());
+
+	std::filesystem::create_directories(std::filesystem::path(cfg_.csv_path).parent_path());
+	if (rc::diag::open_rotating(csv_, cfg_.csv_path,
+	        "wall_ms,x,y,theta,sx,sy,stheta,gps_fixes,gt_x,gt_y,gt_theta,err_xy,err_theta\n"))
+		csv_.imbue(std::locale::classic());
+
+	presence_protocol_.wire(
+		presence_coordinator_, &statemachine, this, configLoader, G, static_cast<std::uint32_t>(agent_id),
+		{
+			.shutting_down      = [this] { return shutting_down_.load(); },
+			// The IMU is POLLED (no reader thread), so it must be pumped while Waiting or its age never
+			// advances and the agent could never be admitted.
+			.pump_primary_input = [this] { pump_imu(); },
+			.primary_age_ms     = [this] { return imu_age_ms(); },
+			.primary_live       = [this] { return rc::stream::live(imu_age_ms(), cfg_.imu_stall_timeout_ms); },
+			.primary_stalled    = [this](std::int64_t *age)
+			{
+				const auto a = imu_age_ms();
+				if (age) *age = a;
+				return rc::stream::stalled(a, cfg_.imu_stall_timeout_ms, presence_protocol_.operating_since_ms(),
+				                           QDateTime::currentMSecsSinceEpoch());
+			},
+			.emit_ready         = [this] { emit presenceReady(); },
+			.emit_lost          = [this] { emit presenceLost(); },
+			.compute            = [this] { compute(); },
+			.terminal_shutdown  = [this] { terminal_shutdown(); },
+			.on_first_operating = {},
+			.on_optional_peer_lost  = [](const std::string &name, std::uint32_t)
+			                          { qInfo() << "[Presence] optional peer lost:" << QString::fromStdString(name); },
+			.on_optional_peer_ready = [](const std::string &name, std::uint32_t)
+			                          { qInfo() << "[Presence] optional peer ready:" << QString::fromStdString(name); },
+		});
+
+	QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit,
+	                 this, &SpecificWorker::terminal_shutdown, Qt::UniqueConnection);
+}
+
+// ── One Operating tick ────────────────────────────────────────────────────────────────────────────
+// Order: odometry first (the latest body velocity), then the IMU frames (each one propagates the filter
+// on its own clock), then the GPS (corrects the propagated state), then publish.
+void SpecificWorker::compute()
+{
+	read_odometry();
+	pump_imu();
+	poll_gps();
+
+	if (ekf_.initialized())
+	{
+		if (field_polygon_.empty())
+			resolve_field_polygon();
+		if (not field_polygon_.empty() and scene_graph_->ensure_room(field_polygon_, cfg_.room_height))
+			publish_pose();
+	}
+	log_status();
+	fps_.print("[openfield_concept Compute]");
+}
+
+// ── IMU: propagate on every frame, correct the heading at a bounded rate ──────────────────────────
+void SpecificWorker::pump_imu()
+{
+	const auto now = QDateTime::currentMSecsSinceEpoch();
+	if (not imu_sub_)
+	{
+		// The producer advertises its descriptor during ITS startup; "not yet" is not "never".
+		if (now - last_imu_try_ms_ < 1000 or not G) return;
+		last_imu_try_ms_ = now;
+		imu_sub_ = rc::media::make_imu_subscriber_from_graph(*G, cfg_.imu_node, "imu");
+		if (not imu_sub_) return;
+		std::println("[openfield] IMU media subscriber up on node '{}'", cfg_.imu_node);
+	}
+
+	imu_sub_->poll([this](const rc::media::ImuFrame &f, std::int64_t)
+	{
+		// Integrate on the clock the RATES are measured in: a simulated gyro reports rad per SIMULATION
+		// second, so wall-clock dt would over- or under-count by the sim/wall ratio. 0 = not simulated.
+		const auto clock = static_cast<std::int64_t>(f.sim_stamp_ms() > 0 ? f.sim_stamp_ms() : f.stamp_ms());
+		if (clock <= last_imu_clock_ms_) return;        // duplicate / reordered sample
+		last_imu_recv_ms_ = QDateTime::currentMSecsSinceEpoch();
+		if (last_imu_clock_ms_ > 0 and ekf_.initialized())
+			ekf_.predict(1e-3 * static_cast<double>(clock - last_imu_clock_ms_), odom_adv_, odom_side_, f.gyro_z());
+		last_imu_clock_ms_ = clock;
+		last_imu_stamp_ms_ = static_cast<std::int64_t>(f.stamp_ms());
+		last_gyro_z_ = f.gyro_z();
+		last_imu_yaw_ = f.yaw();
+
+		// The absolute yaw is a strong measurement; applying it at 120 Hz would treat 120 correlated
+		// samples as independent and make the filter far more certain than the sensor is.
+		if (cfg_.use_imu_yaw and ekf_.initialized() and clock - last_yaw_update_clock_ms_ >= cfg_.yaw_update_period_ms)
+		{
+			ekf_.correct_yaw(f.yaw());
+			last_yaw_update_clock_ms_ = clock;
+		}
+	});
+}
+
+std::int64_t SpecificWorker::imu_age_ms() const
+{
+	return last_imu_recv_ms_ < 0 ? -1 : QDateTime::currentMSecsSinceEpoch() - last_imu_recv_ms_;
+}
+
+// ── Wheel odometry: the robot node's robot_current_* attributes (robot_concept, from the base) ────
+void SpecificWorker::read_odometry()
+{
+	const auto rid = scene_graph_ ? scene_graph_->robot_id() : 0;
+	if (rid == 0) return;
+	const auto node = G->get_node(rid);
+	if (not node.has_value()) return;
+	const auto ts = G->get_attrib_by_name<robot_current_speed_timestamp_att>(node.value());
+	if (not ts.has_value() or static_cast<std::uint64_t>(ts.value()) == last_odom_ts_) return;
+	last_odom_ts_ = static_cast<std::uint64_t>(ts.value());
+	odom_adv_  = G->get_attrib_by_name<robot_current_advance_speed_att>(node.value()).value_or(0.f);
+	odom_side_ = G->get_attrib_by_name<robot_current_side_speed_att>(node.value()).value_or(0.f);
+	odom_rot_  = G->get_attrib_by_name<robot_current_angular_speed_att>(node.value()).value_or(0.f);
+	// {adv, side, rot}; a negative entry is the producer saying "unknown" — fall back to the model's floor.
+	if (const auto v = G->get_attrib_by_name<robot_current_speed_variance_att>(node.value());
+	    v.has_value() and v->get().size() >= 3)
+		for (int i = 0; i < 3; ++i) odom_var_(i) = v->get()[i] >= 0.f ? v->get()[i] : 0.f;
+}
+
+// ── GPS: antenna position in the field frame, from the bridge ─────────────────────────────────────
+void SpecificWorker::poll_gps()
+{
+	const auto now = QDateTime::currentMSecsSinceEpoch();
+	if (now - last_gps_poll_ms_ < cfg_.gps_poll_period_ms) return;
+	last_gps_poll_ms_ = now;
+
+	float x = 0.f, y = 0.f, z = 0.f;
+	bool ok = false;
+	try { ok = gps_proxy->getPos(x, y, z); }
+	catch (const Ice::Exception &e)
+	{
+		static std::int64_t last_warn = 0;
+		if (now - last_warn > 5000) { last_warn = now; qWarning() << "[openfield] GPS unreachable:" << e.what(); }
+		return;
+	}
+	if (not ok) return;
+
+	const Eigen::Vector2d xy{x, y};
+	// The receiver refreshes at its own rate (bridge GPS.Period); a repeated value is the SAME fix read
+	// again, and folding it in twice would double-count its information.
+	if (last_gps_xy_.has_value() and (xy - *last_gps_xy_).norm() == 0.0) return;
+	last_gps_xy_ = xy;
+	++gps_fixes_;
+
+	if (not ekf_.initialized())
+	{
+		if (not last_imu_yaw_.has_value()) return;       // need a heading too
+		ekf_.initialize(xy, *last_imu_yaw_);
+		last_yaw_update_clock_ms_ = last_imu_clock_ms_;
+		std::println("[openfield] initialized from GPS ({:.3f}, {:.3f}) and IMU yaw {:.3f} rad", x, y, *last_imu_yaw_);
+		return;
+	}
+	ekf_.correct_gps(xy);
+}
+
+// ── The field boundary: local metres, or GPS coordinates converted like the bridge does ───────────
+bool SpecificWorker::resolve_field_polygon()
+{
+	std::vector<Eigen::Vector2f> poly;
+	if (cfg_.poly_x.size() >= 3 and cfg_.poly_x.size() == cfg_.poly_y.size())
+	{
+		for (std::size_t i = 0; i < cfg_.poly_x.size(); ++i)
+			poly.emplace_back(static_cast<float>(cfg_.poly_x[i]), static_cast<float>(cfg_.poly_y[i]));
+		std::println("[openfield] field polygon: {} vertices in local metres (Field.PolygonX/Y)", poly.size());
+	}
+	else if (cfg_.poly_lat.size() >= 3 and cfg_.poly_lat.size() == cfg_.poly_lon.size())
+	{
+		// The local origin in UTM = current UTM fix minus the current local fix (same receiver snapshot).
+		int zone = 0; std::string band; double e = 0, n = 0;
+		float x = 0, y = 0, z = 0;
+		try
+		{
+			if (not gps_proxy->getUTMData(zone, band, e, n) or not gps_proxy->getPos(x, y, z))
+				return false;
+		}
+		catch (const Ice::Exception &) { return false; }
+		const double e0 = e - x, n0 = n - y;
+		for (std::size_t i = 0; i < cfg_.poly_lat.size(); ++i)
+		{
+			const auto u = rc::openfield::wgs84_to_utm(cfg_.poly_lat[i], cfg_.poly_lon[i], zone);
+			poly.emplace_back(static_cast<float>(u.east - e0), static_cast<float>(u.north - n0));
+		}
+		std::println("[openfield] field polygon: {} GPS vertices -> local metres (UTM zone {}{})", poly.size(), zone, band);
+	}
+	else
+	{
+		// No boundary configured: a 50 m square around where the robot started, and say so loudly —
+		// the planner will treat everything outside it as occupied.
+		const auto &s = ekf_.state();
+		for (const auto &[dx, dy] : {std::pair{-25., -25.}, {25., -25.}, {25., 25.}, {-25., 25.}})
+			poly.emplace_back(static_cast<float>(s(0) + dx), static_cast<float>(s(1) + dy));
+		qWarning() << "[openfield] no Field.PolygonX/Y nor Field.PolygonLat/Lon in config: using a 50 m square"
+		              " around the start pose";
+	}
+	for (const auto &v : poly) std::println("    ({:.3f}, {:.3f})", v.x(), v.y());
+	field_polygon_ = std::move(poly);
+	return true;
+}
+
+void SpecificWorker::publish_pose()
+{
+	rc::openfield::PoseSample s;
+	const auto &x = ekf_.state();
+	s.x = x(0); s.y = x(1); s.theta = x(2);
+	s.cov = ekf_.covariance();
+	// Body twist: wheels for translation, the GYRO for rotation (the wheels over-report it on a skid-steer).
+	s.adv = odom_adv_; s.side = odom_side_; s.rot = static_cast<float>(last_gyro_z_);
+	const auto &p = ekf_.params();
+	s.vel_var = {std::max(odom_var_(0), static_cast<float>(p.adv_sigma0 * p.adv_sigma0)),
+	             std::max(odom_var_(1), static_cast<float>(p.side_sigma0 * p.side_sigma0)),
+	             static_cast<float>(p.gyro_sigma0 * p.gyro_sigma0)};
+	s.timestamp_ms = last_imu_stamp_ms_ > 0 ? static_cast<std::uint64_t>(last_imu_stamp_ms_)
+	                                        : static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch());
+	if (scene_graph_->publish(s)) ++published_;
+	if (pose_history_.empty() or pose_history_.back().first < static_cast<std::int64_t>(s.timestamp_ms))
+	{
+		pose_history_.emplace_back(static_cast<std::int64_t>(s.timestamp_ms), x);
+		while (pose_history_.size() > 500) pose_history_.pop_front();   // ~10 s at 50 Hz
+	}
+}
+
+// ── 1 Hz status line + CSV, graded against the simulator's ground truth when it is on the graph ───
+void SpecificWorker::log_status()
+{
+	const auto now = QDateTime::currentMSecsSinceEpoch();
+	if (now - last_status_ms_ < 1000) return;
+	last_status_ms_ = now;
+	if (not ekf_.initialized())
+	{
+		std::println("[openfield] waiting for a GPS fix and an IMU yaw (imu age {} ms, gps fixes {})",
+		             imu_age_ms(), gps_fixes_);
+		return;
+	}
+	const auto &x = ekf_.state();
+	const auto &P = ekf_.covariance();
+	const double sx = std::sqrt(P(0, 0)), sy = std::sqrt(P(1, 1)), st = std::sqrt(P(2, 2));
+
+	// Ground truth (simulation only; robot_concept writes it from the supervisor). The bridge's angle is
+	// atan2(R01, R00) - pi/2 of the robot's rotation, i.e. -(yaw) - pi/2; convert to this filter's theta.
+	double gx = NAN, gy = NAN, gth = NAN, exy = NAN, eth = NAN;
+	std::int64_t gt_lag_ms = -1;
+	if (const auto rid = scene_graph_->robot_id(); rid != 0)
+		if (const auto n = G->get_node(rid); n.has_value())
+		{
+			const auto ax = G->get_attrib_by_name<robot_gt_x_att>(n.value());
+			const auto ay = G->get_attrib_by_name<robot_gt_y_att>(n.value());
+			const auto aa = G->get_attrib_by_name<robot_gt_angle_att>(n.value());
+			const auto ats = G->get_attrib_by_name<robot_gt_timestamp_att>(n.value());
+			if (ax.has_value() and ay.has_value() and aa.has_value())
+			{
+				gx = ax.value(); gy = ay.value(); gth = wrap_pi(-(aa.value() + M_PI_2));
+				// Grade the estimate AT the ground truth's timestamp; fall back to the newest one.
+				Eigen::Vector3d est = x;
+				if (ats.has_value())
+					if (const auto at = pose_at(static_cast<std::int64_t>(ats.value())); at.has_value())
+					{
+						est = *at;
+						gt_lag_ms = now - static_cast<std::int64_t>(ats.value());
+					}
+				exy = std::hypot(est(0) - gx, est(1) - gy);
+				eth = wrap_pi(est(2) - gth);
+			}
+		}
+	std::println("[openfield] pose ({:.3f}, {:.3f}, {:.3f} rad) sigma ({:.3f}, {:.3f} m, {:.4f} rad) | gps fixes {} "
+	             "| published {} | GT err {} ",
+	             x(0), x(1), x(2), sx, sy, st, gps_fixes_, published_,
+	             std::isnan(exy) ? std::string("n/a")
+	                             : std::format("{:.3f} m, {:.2f} deg{}", exy, eth * 180.0 / M_PI,
+	                                           gt_lag_ms < 0 ? " (newest estimate, GT unstamped)" : ""));
+	if (csv_.is_open())
+		csv_ << now << ',' << x(0) << ',' << x(1) << ',' << x(2) << ',' << sx << ',' << sy << ',' << st << ','
+		     << gps_fixes_ << ',' << gx << ',' << gy << ',' << gth << ',' << exy << ',' << eth << '\n' << std::flush;
+}
+
+// Linear interpolation in the published-pose history (heading along the short arc).
+std::optional<Eigen::Vector3d> SpecificWorker::pose_at(std::int64_t t) const
+{
+	if (pose_history_.size() < 2 or t < pose_history_.front().first or t > pose_history_.back().first)
+		return std::nullopt;
+	const auto hi = std::ranges::lower_bound(pose_history_, t, {}, &std::pair<std::int64_t, Eigen::Vector3d>::first);
+	if (hi == pose_history_.begin()) return hi->second;
+	const auto lo = std::prev(hi);
+	const double a = hi->first == lo->first ? 0.0
+	               : static_cast<double>(t - lo->first) / static_cast<double>(hi->first - lo->first);
+	Eigen::Vector3d p = lo->second + a * (hi->second - lo->second);
+	p(2) = wrap_pi(lo->second(2) + a * wrap_pi(hi->second(2) - lo->second(2)));
+	return p;
+}
+
+// ── Shutdown: delete what we own ([Owns] in etc/config.toml), leave DDS cleanly, hard-exit ────────
+void SpecificWorker::request_shutdown()
+{
+	if (shutting_down_.exchange(true)) return;
+	if (G) disconnect(G.get(), nullptr, this, nullptr);
+	imu_sub_.reset();
+	if (not owned_nodes_cleaned_)
+	{
+		owned_nodes_cleaned_ = true;
+		presence_coordinator_.cleanup_owned_nodes();
+	}
+}
+
+void SpecificWorker::terminal_shutdown()
+{
+	static std::atomic<bool> terminating{false};
+	if (terminating.exchange(true)) return;
+	rc::agent::terminal_exit([this] { request_shutdown(); }, [this] { if (G) G->reset(); });
+}
+
+void SpecificWorker::emergency()
+{
+	std::cout << "Emergency worker" << std::endl;
+}
+
+void SpecificWorker::restore()
+{
+	std::cout << "Restore worker" << std::endl;
+}
+
+int SpecificWorker::startup_check()
+{
+	std::string report;
+	const bool ok = rc::openfield::OpenFieldEkf::self_test(&report);
+	std::println("{}", report);
+	QTimer::singleShot(200, QCoreApplication::instance(), SLOT(quit()));
+	return ok ? 0 : 1;
+}

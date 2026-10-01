@@ -1,0 +1,18 @@
+# Cognitive stack for the Husky A300 in the agricultural worlds (plan.md, F4).
+#   python3 cognitive.py cognitive_husky.toml
+# Assumes the sensorimotor layer is up (python3 subcognitive.py sub_husky.toml) and Webots has a
+# webots-agri world open. Every cwd points inside this repo.
+#
+# Order follows the DSR dependency graph:
+#   robot_concept (bootstraps the graph from husky.json) -> openfield_concept (GPS+IMU+wheels pose,
+#   the room_concept replacement) -> controller / residual (later, F5).
+
+[[components]]
+name = "robot_concept"
+cwd  = "~/robocomp/AiGB_UEx_Navigation/active_inference/robot_concept"
+cmd  = "bin/robot_concept etc/config_husky.toml"
+
+[[components]]
+name = "openfield_concept"
+cwd  = "~/robocomp/AiGB_UEx_Navigation/active_inference/openfield_concept"
+cmd  = "bin/openfield_concept etc/config.toml"   # GPS+IMU+wheels EKF -> room node + robot->room RT

@@ -1,0 +1,12 @@
+import "GPS.idsl";
+
+Component openfield_concept
+{
+    Communications
+    {
+        requires GPS;
+    };
+    language Cpp11;
+    options dsr;
+
+};
