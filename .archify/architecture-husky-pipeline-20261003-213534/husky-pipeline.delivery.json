@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "143cc004-04de-48be-8e02-e3597f7d213d",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "/home/nosl3n/robocomp/AiGB_UEx_Navigation/.archify/architecture-husky-pipeline-20261003-213534/candidate.json",
+  "output": "/home/nosl3n/robocomp/AiGB_UEx_Navigation/.archify/architecture-husky-pipeline-20261003-213534/husky-pipeline.html",
+  "specification": {
+    "sha256": "49363619bfcbdb6d5e25ce441213897dc68d3ca8da402873edbb4dce7255cf23",
+    "bytes": 18627
+  },
+  "artifact": {
+    "sha256": "09d6c2995bd1a74688b740407339965a2d40d412309a033db2ec61db5ed84b90",
+    "bytes": 803780
+  }
+}

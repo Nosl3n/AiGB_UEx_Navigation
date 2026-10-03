@@ -1,0 +1,787 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Pipeline Husky A300: Webots, capa sensoriomotora y capa cognitiva",
+    "output": ".archify/architecture-husky-pipeline-20261003-213534/husky-pipeline.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Nosl3n/AiGB_UEx_Navigation.git",
+      "provider": "github",
+      "revision": "b0499d773ab94a3a1b0ea547994446666a727201"
+    },
+    "views": [
+      {
+        "id": "percepcion",
+        "label": "Sensores a grafo",
+        "focus": [
+          "webots",
+          "bridge",
+          "helios",
+          "imu",
+          "zed",
+          "dds",
+          "residual",
+          "retina",
+          "human",
+          "dsr"
+        ],
+        "note": "Cómo llega cada sensor de Webots al grafo DSR pasando por el plano de medios DDS."
+      },
+      {
+        "id": "localizacion",
+        "label": "Localización",
+        "focus": [
+          "bridge",
+          "imu",
+          "dds",
+          "icestorm",
+          "robot-concept",
+          "openfield",
+          "dsr"
+        ],
+        "note": "EKF de openfield_concept: GPS por Ice, IMU por DDS y odometría de ruedas desde el grafo."
+      },
+      {
+        "id": "control",
+        "label": "Lazo de control",
+        "focus": [
+          "send-goal",
+          "dsr",
+          "controller",
+          "bridge",
+          "webots",
+          "joy",
+          "icestorm"
+        ],
+        "note": "Del objetivo en el grafo a setSpeedBase en el bridge; el mando Xbox entra por IceStorm."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "webots",
+      "type": "external",
+      "label": "Webots R2025a",
+      "sublabel": "husky_field.wbt",
+      "tag": "DEF husky",
+      "pos": [
+        40,
+        370
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "sources": [
+        {
+          "path": "webots-agri/worlds/husky_field.wbt",
+          "line": 51,
+          "label": "robot DEF husky"
+        },
+        {
+          "path": "active_inference/utils/netmon/launcher.py",
+          "line": 141,
+          "end_line": 151,
+          "label": "el lanzador abre Webots"
+        }
+      ]
+    },
+    {
+      "id": "joy",
+      "type": "external",
+      "label": "Mando Xbox",
+      "sublabel": "python_xbox_controller",
+      "pos": [
+        40,
+        640
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "sources": [
+        {
+          "path": "active_inference/utils/sub_husky.toml",
+          "line": 43,
+          "end_line": 45,
+          "label": "entrada joy"
+        },
+        {
+          "path": "robocomp-robolab/components/hardware/external_control/python_xbox_controller/src/specificworker.py",
+          "line": 158,
+          "label": "sendData"
+        }
+      ]
+    },
+    {
+      "id": "icestorm",
+      "type": "messagebus",
+      "label": "IceStorm",
+      "sublabel": "rcnode :9999",
+      "pos": [
+        280,
+        640
+      ],
+      "size": [
+        150,
+        60
+      ],
+      "sources": [
+        {
+          "path": "webots-bridge/etc/config_husky",
+          "line": 4,
+          "label": "TopicManager :9999"
+        },
+        {
+          "path": "active_inference/utils/netmon/launcher.py",
+          "line": 86,
+          "end_line": 99,
+          "label": "arranque de rcnode"
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "Webots2Robocomp",
+      "sublabel": "bridge · Ice",
+      "tag": "skid-steer",
+      "pos": [
+        280,
+        260
+      ],
+      "size": [
+        150,
+        280
+      ],
+      "sources": [
+        {
+          "path": "active_inference/utils/sub_husky.toml",
+          "line": 15,
+          "end_line": 18,
+          "label": "entrada bridge"
+        },
+        {
+          "path": "webots-bridge/etc/config_husky",
+          "line": 6,
+          "end_line": 17,
+          "label": "endpoints Ice"
+        },
+        {
+          "path": "webots-bridge/src/specificworker.cpp",
+          "line": 1907,
+          "end_line": 1954,
+          "label": "joystick a base"
+        }
+      ]
+    },
+    {
+      "id": "helios",
+      "type": "backend",
+      "label": "lidar3d_dds",
+      "sublabel": "helios · auto-filtro",
+      "pos": [
+        555,
+        270
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "sources": [
+        {
+          "path": "robocomp-robolab/components/hardware/laser/lidar3d_dds/etc/config_helios_husky_webots.toml",
+          "line": 46,
+          "end_line": 53,
+          "label": "proxy y endpoints"
+        },
+        {
+          "path": "robocomp-robolab/components/hardware/laser/lidar3d_dds/src/specificworker.cpp",
+          "line": 432,
+          "label": "getLidarData"
+        },
+        {
+          "path": "robocomp-robolab/components/hardware/laser/lidar3d_dds/src/specificworker.cpp",
+          "line": 605,
+          "label": "publica en DDS"
+        }
+      ]
+    },
+    {
+      "id": "imu",
+      "type": "backend",
+      "label": "imu_dds",
+      "sublabel": "IMU Ice a DDS",
+      "pos": [
+        555,
+        370
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "sources": [
+        {
+          "path": "robocomp-robolab/components/hardware/imu/imu_dds/etc/config.toml",
+          "line": 18,
+          "end_line": 37,
+          "label": "proxy IMU y DDS"
+        },
+        {
+          "path": "robocomp-robolab/components/hardware/imu/imu_dds/src/specificworker.cpp",
+          "line": 171,
+          "label": "getDataImu"
+        },
+        {
+          "path": "robocomp-robolab/components/hardware/imu/imu_dds/src/specificworker.cpp",
+          "line": 298,
+          "label": "publica en DDS"
+        }
+      ]
+    },
+    {
+      "id": "zed",
+      "type": "backend",
+      "label": "zed_camera",
+      "sublabel": "RGB-D simulada",
+      "pos": [
+        555,
+        470
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "sources": [
+        {
+          "path": "robocomp-robolab/components/hardware/camera/zed_camera/etc/configHuskyWebot.toml",
+          "line": 1,
+          "end_line": 38,
+          "label": "proxy y tópicos"
+        },
+        {
+          "path": "robocomp-robolab/components/hardware/camera/zed_camera/src/specificworker.cpp",
+          "line": 487,
+          "label": "getAll"
+        },
+        {
+          "path": "robocomp-robolab/components/hardware/camera/zed_camera/src/specificworker.cpp",
+          "line": 615,
+          "label": "publish_rgb"
+        }
+      ]
+    },
+    {
+      "id": "dds",
+      "type": "messagebus",
+      "label": "Plano de medios",
+      "sublabel": "DDS dominio 7 · SHM",
+      "pos": [
+        820,
+        270
+      ],
+      "size": [
+        140,
+        260
+      ],
+      "sources": [
+        {
+          "path": "robocomp-robolab/components/hardware/imu/imu_dds/etc/config.toml",
+          "line": 31,
+          "end_line": 40,
+          "label": "dominio 7 separado del DSR"
+        },
+        {
+          "path": "active_inference/common/media_transport/media_transport.h",
+          "line": 466,
+          "label": "suscriptor desde el grafo"
+        }
+      ]
+    },
+    {
+      "id": "openfield",
+      "type": "backend",
+      "label": "openfield_concept",
+      "sublabel": "EKF GPS+IMU+ruedas",
+      "tag": "agente 25",
+      "pos": [
+        1080,
+        170
+      ],
+      "size": [
+        170,
+        60
+      ],
+      "sources": [
+        {
+          "path": "active_inference/openfield_concept/etc/config.toml",
+          "line": 4,
+          "end_line": 35,
+          "label": "proxy GPS y nodo field"
+        },
+        {
+          "path": "active_inference/openfield_concept/src/specificworker.cpp",
+          "line": 242,
+          "end_line": 305,
+          "label": "IMU, odometría y GPS"
+        },
+        {
+          "path": "active_inference/openfield_concept/src/openfield_scene_graph.cpp",
+          "line": 50,
+          "end_line": 136,
+          "label": "crea field y arista RT"
+        }
+      ]
+    },
+    {
+      "id": "residual",
+      "type": "backend",
+      "label": "residual_concept",
+      "sublabel": "rejilla de ocupación",
+      "tag": "agente 14",
+      "pos": [
+        1080,
+        270
+      ],
+      "size": [
+        170,
+        60
+      ],
+      "sources": [
+        {
+          "path": "active_inference/residual_concept/etc/config_husky.toml",
+          "line": 37,
+          "end_line": 49,
+          "label": "dependencias y nodos"
+        },
+        {
+          "path": "active_inference/residual_concept/src/residual_lidar_ingestor.h",
+          "line": 2,
+          "label": "entrada LiDAR"
+        },
+        {
+          "path": "active_inference/residual_concept/src/specificworker.cpp",
+          "line": 1740,
+          "end_line": 1751,
+          "label": "crea el nodo residual"
+        }
+      ]
+    },
+    {
+      "id": "human",
+      "type": "backend",
+      "label": "human_concept",
+      "sublabel": "personas + LiDAR",
+      "tag": "agente 13",
+      "pos": [
+        1080,
+        370
+      ],
+      "size": [
+        170,
+        60
+      ],
+      "sources": [
+        {
+          "path": "active_inference/human_concept/src/skeleton_source.cpp",
+          "line": 113,
+          "label": "lee el nodo skeleton"
+        },
+        {
+          "path": "active_inference/human_concept/src/specificworker.cpp",
+          "line": 214,
+          "label": "ingestor LiDAR"
+        },
+        {
+          "path": "active_inference/human_concept/src/human_scene_graph.cpp",
+          "line": 61,
+          "end_line": 69,
+          "label": "crea person_N"
+        }
+      ]
+    },
+    {
+      "id": "retina",
+      "type": "backend",
+      "label": "retina",
+      "sublabel": "YOLO seg + pose",
+      "tag": "agente 9",
+      "pos": [
+        1080,
+        470
+      ],
+      "size": [
+        170,
+        60
+      ],
+      "sources": [
+        {
+          "path": "active_inference/retina/etc/config_husky.toml",
+          "line": 33,
+          "end_line": 47,
+          "label": "tópicos y dependencias"
+        },
+        {
+          "path": "active_inference/retina/src/graph_publisher.cpp",
+          "line": 39,
+          "label": "nodo masks"
+        },
+        {
+          "path": "active_inference/retina/src/graph_publisher.cpp",
+          "line": 915,
+          "label": "nodo skeleton"
+        }
+      ]
+    },
+    {
+      "id": "robot-concept",
+      "type": "backend",
+      "label": "robot_concept",
+      "sublabel": "cuerpo: husky.json",
+      "tag": "agente 6",
+      "pos": [
+        1080,
+        640
+      ],
+      "size": [
+        170,
+        60
+      ],
+      "sources": [
+        {
+          "path": "active_inference/utils/cognitive_husky.toml",
+          "line": 11,
+          "end_line": 13,
+          "label": "primero en arrancar"
+        },
+        {
+          "path": "active_inference/robot_concept/etc/config_husky.toml",
+          "line": 4,
+          "end_line": 23,
+          "label": "proxies y suscripción"
+        },
+        {
+          "path": "active_inference/robot_concept/src/specificworker.cpp",
+          "line": 2126,
+          "end_line": 2140,
+          "label": "odometría al nodo robot"
+        }
+      ]
+    },
+    {
+      "id": "dsr",
+      "type": "database",
+      "label": "Grafo DSR",
+      "sublabel": "cortex · dominio 0",
+      "pos": [
+        1385,
+        170
+      ],
+      "size": [
+        150,
+        530
+      ],
+      "sources": [
+        {
+          "path": "active_inference/common/world_frame/world_frame.h",
+          "line": 31,
+          "label": "marco field o room"
+        },
+        {
+          "path": "active_inference/openfield_concept/etc/config.toml",
+          "line": 8,
+          "end_line": 12,
+          "label": "Agent.domain = 0"
+        }
+      ]
+    },
+    {
+      "id": "controller",
+      "type": "backend",
+      "label": "controller",
+      "sublabel": "planificador + MPPI",
+      "tag": "agente 8",
+      "pos": [
+        1385,
+        40
+      ],
+      "size": [
+        150,
+        60
+      ],
+      "sources": [
+        {
+          "path": "active_inference/controller/etc/config_husky.toml",
+          "line": 3,
+          "end_line": 5,
+          "label": "proxy OmniRobot"
+        },
+        {
+          "path": "active_inference/controller/src/controller_obstacle_tracker.cpp",
+          "line": 1180,
+          "end_line": 1212,
+          "label": "lee person y residual"
+        },
+        {
+          "path": "active_inference/controller/src/controller_motion_commander.cpp",
+          "line": 446,
+          "label": "setSpeedBase"
+        }
+      ]
+    },
+    {
+      "id": "send-goal",
+      "type": "frontend",
+      "label": "send_goal.py",
+      "sublabel": "objetivo X Y",
+      "tag": "agente 98",
+      "pos": [
+        1385,
+        790
+      ],
+      "size": [
+        150,
+        60
+      ],
+      "sources": [
+        {
+          "path": "active_inference/utils/send_goal.py",
+          "line": 58,
+          "end_line": 61,
+          "label": "nodo goal y goto_action"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "subcognitive.py sub_husky.toml · capa sensoriomotora",
+      "wraps": [
+        "bridge",
+        "helios",
+        "imu",
+        "zed"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "cognitive.py cognitive_husky.toml · capa cognitiva",
+      "wraps": [
+        "openfield",
+        "residual",
+        "human",
+        "retina",
+        "robot-concept"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "webots-bridge",
+      "from": "webots",
+      "to": "bridge",
+      "label": "API Webots",
+      "variant": "emphasis"
+    },
+    {
+      "id": "bridge-helios",
+      "from": "bridge",
+      "to": "helios",
+      "label": "Lidar3D :11988"
+    },
+    {
+      "id": "bridge-imu",
+      "from": "bridge",
+      "to": "imu",
+      "label": "IMU :10007"
+    },
+    {
+      "id": "bridge-zed",
+      "from": "bridge",
+      "to": "zed",
+      "label": "RGBD :10096"
+    },
+    {
+      "id": "helios-dds",
+      "from": "helios",
+      "to": "dds",
+      "label": "lidar3d/points"
+    },
+    {
+      "id": "imu-dds",
+      "from": "imu",
+      "to": "dds",
+      "label": "imu/data"
+    },
+    {
+      "id": "zed-dds",
+      "from": "zed",
+      "to": "dds",
+      "label": "zed/rgb+depth"
+    },
+    {
+      "id": "dds-openfield",
+      "from": "dds",
+      "to": "openfield",
+      "label": "IMU",
+      "fromSide": "top",
+      "toSide": "left"
+    },
+    {
+      "id": "dds-residual",
+      "from": "dds",
+      "to": "residual",
+      "label": "LiDAR + ZED"
+    },
+    {
+      "id": "dds-human",
+      "from": "dds",
+      "to": "human",
+      "label": "LiDAR"
+    },
+    {
+      "id": "dds-retina",
+      "from": "dds",
+      "to": "retina",
+      "label": "ZED RGB-D"
+    },
+    {
+      "id": "bridge-gps",
+      "from": "bridge",
+      "to": "openfield",
+      "label": "GPS :10009",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "top"
+    },
+    {
+      "id": "joy-icestorm",
+      "from": "joy",
+      "to": "icestorm",
+      "label": "Joystick"
+    },
+    {
+      "id": "icestorm-bridge",
+      "from": "icestorm",
+      "to": "bridge",
+      "label": "sendData",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "bridge-icestorm",
+      "from": "bridge",
+      "to": "icestorm",
+      "label": "FullPose",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "icestorm-robot",
+      "from": "icestorm",
+      "to": "robot-concept",
+      "label": "odometría de ruedas (FullPoseEstimationPub)",
+      "variant": "dashed"
+    },
+    {
+      "id": "openfield-dsr",
+      "from": "openfield",
+      "to": "dsr",
+      "label": "field + RT robot"
+    },
+    {
+      "id": "residual-dsr",
+      "from": "residual",
+      "to": "dsr",
+      "label": "nodo residual"
+    },
+    {
+      "id": "human-dsr",
+      "from": "human",
+      "to": "dsr",
+      "label": "person_N"
+    },
+    {
+      "id": "retina-dsr",
+      "from": "retina",
+      "to": "dsr",
+      "label": "masks+skeleton"
+    },
+    {
+      "id": "robot-dsr",
+      "from": "robot-concept",
+      "to": "dsr",
+      "label": "husky + odom"
+    },
+    {
+      "id": "dsr-controller",
+      "from": "dsr",
+      "to": "controller",
+      "label": "mundo",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "send-goal-dsr",
+      "from": "send-goal",
+      "to": "dsr",
+      "label": "goal",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "controller-bridge",
+      "from": "controller",
+      "to": "bridge",
+      "label": "setSpeedBase :10004 (OmniRobot)",
+      "variant": "emphasis",
+      "fromSide": "left",
+      "toSide": "top"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Cómo se lanza",
+      "items": [
+        "1. webots husky_field.wbt: el mundo con el Husky, 2 trabajadores y 5x10 palmeras",
+        "2. subcognitive.py sub_husky.toml: bridge, helios, imu, zed y joy",
+        "3. cognitive.py cognitive_husky.toml: robot_concept, openfield, residual, controller, retina, human",
+        "Ambos lanzadores usan netmon/launcher.py y comparten un monitor web en :8080"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Tres planos de comunicación",
+      "items": [
+        "Ice (RPC): el bridge sirve sensores y base por puertos fijos",
+        "DDS dominio 7: nubes e imágenes por memoria compartida, sin copia",
+        "DSR dominio 0: grafo compartido donde los agentes leen y escriben",
+        "IceStorm :9999 solo lleva el mando y la odometría de ruedas"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Qué escribe cada agente en el grafo",
+      "items": [
+        "robot_concept: árbol husky y descriptores DDS en los nodos zed, helios, imu",
+        "openfield_concept: nodo field (marco del mundo) y la pose del robot",
+        "residual_concept: nodo residual, todo retorno que nadie explica (palmeras)",
+        "retina: masks y skeleton; human_concept lee skeleton y crea person_N"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Dependencias de arranque",
+      "items": [
+        "robot_concept va primero: siembra el grafo desde husky.json",
+        "openfield necesita a robot_concept; residual, controller y retina a ambos",
+        "Los consumidores DDS descubren el tópico leyendo el descriptor del grafo",
+        "El controller lee field, residual y person, y manda la base por Ice"
+      ]
+    }
+  ]
+}
